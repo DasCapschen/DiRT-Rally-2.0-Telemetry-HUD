@@ -663,9 +663,7 @@ static void compute_swapchain_display(struct swapchain_data *data)
    /* DRAW IMGUI */
    ImGui::Begin("Main", &is_open, ImGuiWindowFlags_NoDecoration);
    {
-      //ImGui::PushFont(data->font1);
       ImGui::Text("Socket Open: %d", instance_data->socket);
-      //ImGui::PopFont();
 
       ImGui::Separator();
 
