@@ -482,7 +482,7 @@ static struct swapchain_data *new_swapchain_data(VkSwapchainKHR swapchain,
    struct swapchain_data *data = rzalloc(NULL, struct swapchain_data);
    data->device = device_data;
    data->swapchain = swapchain;
-   data->window_size = ImVec2(300, 300); //used to be instancedata->params.width/height
+   data->window_size = ImVec2(500, 300); //used to be instancedata->params.width/height
    list_inithead(&data->draws);
    map_object(HKEY(data->swapchain), data);
    return data;
@@ -1322,7 +1322,7 @@ static void setup_swapchain_data_pipeline(struct swapchain_data *data)
    device_data->vtable.DestroyShaderModule(device_data->device, frag_module, NULL);
 
    ImGuiIO& io = ImGui::GetIO();
-   int font_size = 12;
+   int font_size = 16;
 
    // ImGui takes ownership of the data, no need to free it
    ImFontConfig font_cfg = ImFontConfig();
@@ -1998,7 +1998,7 @@ static VkResult overlay_CreateInstance(
                              &instance_data->vtable);
    instance_data_map_physical_devices(instance_data, true);
 
-   int font_size = 12;
+   int font_size = 16;
 
    hudSpacing = font_size / 2;
    hudFirstRow = font_size * 4.5;
