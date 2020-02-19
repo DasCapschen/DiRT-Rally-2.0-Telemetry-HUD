@@ -894,11 +894,10 @@ static void compute_swapchain_display(struct swapchain_data *data)
 
       ImGui::Separator();
 
-      //COLUMNS ARE BACKWARDS, RIGHT TO LEFT
       ImGui::Columns(3);
       {
-         VerticalProgressBar(instance_data->telemetry_data.throttle, ImVec2(0.0f,0.0f));
-         ImGui::Text("Throttle");
+         VerticalProgressBar(instance_data->telemetry_data.clutch, ImVec2(0.0f,0.0f));
+         ImGui::Text("Clutch");  
 
          ImGui::NextColumn();
 
@@ -907,8 +906,8 @@ static void compute_swapchain_display(struct swapchain_data *data)
 
          ImGui::NextColumn();
 
-         VerticalProgressBar(instance_data->telemetry_data.clutch, ImVec2(0.0f,0.0f));
-         ImGui::Text("Clutch");   
+         VerticalProgressBar(instance_data->telemetry_data.throttle, ImVec2(0.0f,0.0f));
+         ImGui::Text("Throttle");
       }
       ImGui::Columns(1);
 
