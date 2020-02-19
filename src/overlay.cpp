@@ -685,7 +685,15 @@ static void compute_swapchain_display(struct swapchain_data *data)
 
       ImGui::Separator();
 
-      ImGui::Text("Gear: %d", (int)instance_data->telemetry_data.gear);
+      int gear = (int)instance_data->telemetry_data.gear;
+      if (gear < 0) 
+      {
+         ImGui::Text("Gear: R");
+      }
+      else
+      {
+         ImGui::Text("Gear: %d", gear);
+      }
 
       float rpm_progress = 0;
       if (instance_data->telemetry_data.max_rpm > 0)
