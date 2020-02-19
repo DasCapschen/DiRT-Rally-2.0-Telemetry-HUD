@@ -911,7 +911,7 @@ static void compute_swapchain_display(struct swapchain_data *data)
       }
       ImGui::Columns(1);
 
-      MiddleProgressBar(instance_data->telemetry_data.steering, ImVec2(0.0f,0.0f));
+      MiddleProgressBar(instance_data->telemetry_data.steering, ImVec2(-1.0f,0.0f));
 
       //you can do text without color, and without push / pop font too!
 
