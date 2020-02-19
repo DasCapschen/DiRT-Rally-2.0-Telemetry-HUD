@@ -696,7 +696,7 @@ static void compute_swapchain_display(struct swapchain_data *data)
       ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
       ImGui::Text("%4.0f RPM", instance_data->telemetry_data.rpm * 10.f);
 
-      ImGui::Text("%3.0f km/h", instance_data->telemetry_data.speed);
+      ImGui::Text("%3.0f km/h", instance_data->telemetry_data.speed * 3.6f);
 
       ImGui::Separator();
 
