@@ -1,6 +1,6 @@
 # DiRT HUD
 
-A dirty hack of MangoHUD (which I forked form) to display Dirt Rally 2.0 Telemetry Data ingame.  
+A dirty hack of MangoHUD (which I forked from) to display Dirt Rally 2.0 Telemetry Data ingame.  
 
 I am very sorry to the creators of MangoHUD for butchering their code, but also very thankful that they have created this amazing project!
 
@@ -8,15 +8,15 @@ I am very sorry to the creators of MangoHUD for butchering their code, but also 
 First clone this repository and cd into it:
 
 ```
-git clone --recurse-submodules https://github.com/flightlessmango/MangoHud.git
-cd MangoHud
+git clone --recurse-submodules https://github.com/DasCapschen/DiRTHUD.git
+cd DiRTHUD
 ```
 
 Then simply run the following command:
 
 `./build.sh install`
 
-This will build and copy `libMangoHud.so` & `libMangoHud32.so` to `$HOME/.local/share/MangoHud`, as well as copying the required Vulkan layer configuration files.
+This will build and copy `libDiRTHud.so` & `libDiRTHud32.so` to `$HOME/.local/share/DiRTHud`, as well as copying the required Vulkan layer configuration files.
 
 ---
 
