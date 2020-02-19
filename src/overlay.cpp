@@ -41,6 +41,7 @@
 #include <vulkan/vk_layer.h>
 
 #include "imgui.h"
+#include "imgui_internal.h" //custom widgets...
 
 #include "font_default.h"
 
@@ -173,8 +174,9 @@ struct swapchain_data {
 
    struct list_head draws; /* List of struct overlay_draw */
 
-   ImFont* font = nullptr;
-   ImFont* font1 = nullptr;
+   ImFont* small_font = nullptr;
+   ImFont* medium_font = nullptr;
+   ImFont* big_font = nullptr;
    bool font_uploaded;
    VkImage font_image;
    VkImageView font_image_view;
@@ -648,6 +650,202 @@ static void position_layer(struct swapchain_data *data)
                            ImGuiCond_Always);
 }
 
+static void RPMGauge(float fraction, const ImVec2& size_arg, float min_rpm, float max_rpm, float rpm_step, char* label_fmt, int gear, float speed, ImFont* gear_font) {
+   ImGuiWindow* window = ImGui::GetCurrentWindow();
+   if (window->SkipItems)
+      return;
+
+   ImGuiContext& g = *GImGui;
+   const ImGuiStyle& style = g.Style;
+
+   float angle_min = 0.75f * IM_PI;
+   float angle_max = 2.0f * IM_PI;
+
+   float height_scale = (1.0f + ImSin(angle_min)) * 0.5f;
+
+   ImVec2 pos = window->DC.CursorPos;
+   float thickness = g.FontSize + style.FramePadding.y*2.0f;
+   float w = ImGui::CalcItemWidth();
+   ImVec2 size = ImGui::CalcItemSize(size_arg, w, w * height_scale);
+   ImRect bb(pos, ImVec2( pos.x + size.x, pos.y + size.x ));
+   ImGui::ItemSize(size, style.FramePadding.y);
+   if (!ImGui::ItemAdd(bb, 0))
+      return;
+
+   // Render
+   fraction = ImSaturate(fraction);
+
+   float radius = 0.5f*size.x - g.FontSize;
+   float fraction_angle = angle_min + (fraction * (angle_max-angle_min));
+
+   ImVec2 center( 0.5f*(bb.Min.x + bb.Max.x), 0.5*(bb.Min.y + bb.Max.y) );
+   window->DrawList->PathArcTo(center, radius - thickness, angle_min, angle_max, 30);
+   window->DrawList->PathStroke(ImGui::GetColorU32(ImGuiCol_FrameBg), false, thickness);
+
+   window->DrawList->PathArcTo(center, radius - thickness, angle_min, fraction_angle, 30);
+   window->DrawList->PathStroke(ImGui::GetColorU32(ImGuiCol_PlotHistogram), false, thickness - style.FrameBorderSize);
+
+   int steps = (max_rpm - min_rpm) / rpm_step;
+   for (int i = 0; i <= steps; i++)
+   {
+      float val = min_rpm + (i/(float)steps) * max_rpm/rpm_step;
+      char label_buf[32];
+      ImFormatString(label_buf, IM_ARRAYSIZE(label_buf), label_fmt, val);
+      ImVec2 label_size = ImGui::CalcTextSize(label_buf, NULL);
+
+      float a = angle_min + ((float)i / (float)steps) * (angle_max - angle_min);
+      float cos = ImCos(a);
+      float sin = ImSin(a);
+      float label_cos = (0.5f * (-cos + 1.f)) * label_size.x;
+      float label_sin = (0.5f * (-sin + 1.f)) * 0.5f*label_size.y;
+      ImVec2 pos(center.x + cos * radius - label_cos, center.y + sin * radius - label_sin);
+      
+      ImGui::RenderText(pos, label_buf);
+   }
+
+   char gear_buf[2];
+   if(gear < 0)
+   {
+      gear_buf[0] = 'R';
+      gear_buf[1] = 0;
+   }
+   else
+   {
+      ImFormatString(gear_buf, IM_ARRAYSIZE(gear_buf), "%d", gear);
+   }
+
+   ImGui::PushFont(gear_font);
+   {
+      ImVec2 label_size = ImGui::CalcTextSize(gear_buf, NULL);
+      ImGui::RenderText( ImVec2(center.x - 0.5f * label_size.x, center.y - label_size.y), gear_buf );
+      char speed_buf[9];
+
+      ImFormatString(speed_buf, IM_ARRAYSIZE(speed_buf), "%3.0f km/h", speed);
+      ImGui::RenderText( ImVec2(center.x - 0.5f * label_size.x, center.y + 0.25f * label_size.y), speed_buf );
+   }
+   ImGui::PopFont();
+
+   /* this is really cool, but probably not that nice to look at :(
+   char rpm_buf[32];
+   ImFormatString(rpm_buf, IM_ARRAYSIZE(rpm_buf), "%5.0f RPM", fraction * max_rpm);
+   ImVec2 label_size = ImGui::CalcTextSize(rpm_buf, NULL);
+   radius -= 2.0f*thickness;
+   float cos = ImCos(fraction_angle);
+   float sin = ImSin(fraction_angle);
+   float label_cos = (0.5f * (cos + 1.f)) * label_size.x;
+   float label_sin = (0.5f * (sin + 1.f)) * label_size.y;
+   pos = ImVec2(center.x + cos * radius - label_cos, center.y + sin * radius - 2.0f*label_sin);
+   ImGui::RenderText(pos, rpm_buf);
+   */
+
+   // Default displaying the fraction as percentage string, but user can override it
+   /*char overlay_buf[32];
+   if (!overlay)
+   {
+      ImFormatString(overlay_buf, IM_ARRAYSIZE(overlay_buf), "%.0f%%", fraction*100+0.01f);
+      overlay = overlay_buf;
+   }
+
+   ImVec2 overlay_size = ImGui::CalcTextSize(overlay, NULL);
+   if (overlay_size.x > 0.0f)
+      ImGui::RenderTextClipped(ImVec2(ImClamp(fill_br.x + style.ItemSpacing.x, bb.Min.x, bb.Max.x - overlay_size.x - style.ItemInnerSpacing.x), bb.Min.y), bb.Max, overlay, NULL, &overlay_size, ImVec2(0.0f,0.5f), &bb);
+      */
+}
+
+//y grows from top to bottom!!
+static void VerticalProgressBar(float fraction, const ImVec2& size_arg, const char* overlay = NULL) {
+   ImGuiWindow* window = ImGui::GetCurrentWindow();
+   if (window->SkipItems)
+      return;
+
+   ImGuiContext& g = *GImGui;
+   const ImGuiStyle& style = g.Style;
+
+   ImVec2 size = ImGui::CalcItemSize(size_arg, g.FontSize + style.FramePadding.x*2.0f, ImGui::CalcItemWidth());
+   ImVec2 pos = window->DC.CursorPos;
+   ImRect bb(pos, ImVec2( pos.x + size.x, pos.y + size.y ));
+   ImGui::ItemSize(bb, style.FramePadding.y);
+   if (!ImGui::ItemAdd(bb, 0))
+      return;
+
+   // Render
+   fraction = ImSaturate(fraction);
+   ImGui::RenderFrame(bb.Min, bb.Max, ImGui::GetColorU32(ImGuiCol_FrameBg), true, style.FrameRounding);
+   bb.Expand(ImVec2(-style.FrameBorderSize, -style.FrameBorderSize));
+   const ImVec2 fill_br = ImVec2(bb.Max.x, ImLerp(bb.Max.y, bb.Min.y, fraction));
+
+   if (fraction != 0.0f)
+   {
+      window->DrawList->AddRectFilled(fill_br, ImVec2(bb.Min.x, bb.Max.y), ImGui::GetColorU32(ImGuiCol_PlotHistogram), 0.0f);
+   }
+
+   // Default displaying the fraction as percentage string, but user can override it
+   char overlay_buf[32];
+   if (!overlay)
+   {
+      ImFormatString(overlay_buf, IM_ARRAYSIZE(overlay_buf), "%.0f%%", fraction*100+0.01f);
+      overlay = overlay_buf;
+   }
+
+   ImVec2 overlay_size = ImGui::CalcTextSize(overlay, NULL);
+   float pos_x = bb.Max.x + style.ItemSpacing.x;
+   float pos_y = ImClamp(fill_br.y - 0.5f*overlay_size.y, bb.Min.y, bb.Max.y - overlay_size.y);
+   if (overlay_size.x > 0.0f)
+      ImGui::RenderText( ImVec2(pos_x, pos_y), overlay );
+      //ImGui::RenderTextClipped(ImVec2(bb.Min.x, ImClamp(fill_br.y - overlay_size.y - style.ItemSpacing.y, bb.Min.y, bb.Max.y - overlay_size.y - style.ItemInnerSpacing.y)), bb.Max, overlay, NULL, &overlay_size, ImVec2(0.5f,0.0f), &bb);
+}
+
+//fraction in -1 to 1
+static void MiddleProgressBar(float fraction, const ImVec2& size_arg, const char* overlay = NULL) {
+   ImGuiWindow* window = ImGui::GetCurrentWindow();
+   if (window->SkipItems)
+      return;
+
+   ImGuiContext& g = *GImGui;
+   const ImGuiStyle& style = g.Style;
+
+   ImVec2 pos = window->DC.CursorPos;
+   ImVec2 size = ImGui::CalcItemSize(size_arg, ImGui::CalcItemWidth(), g.FontSize + style.FramePadding.y*2.0f);
+   ImRect bb(pos, ImVec2(pos.x + size.x, pos.y + size.y));
+   ImGui::ItemSize(size, style.FramePadding.y);
+   if (!ImGui::ItemAdd(bb, 0))
+      return;
+
+   // Render
+   fraction = ImClamp(fraction, -1.0f, 1.0f);
+   ImGui::RenderFrame(bb.Min, bb.Max, ImGui::GetColorU32(ImGuiCol_FrameBg), true, style.FrameRounding);
+   bb.Expand(ImVec2(-style.FrameBorderSize, -style.FrameBorderSize));
+   
+   // Default displaying the fraction as percentage string, but user can override it
+   char overlay_buf[32];
+   if (!overlay)
+   {
+      ImFormatString(overlay_buf, IM_ARRAYSIZE(overlay_buf), "%.0f%%", fraction*100+0.01f);
+      overlay = overlay_buf;
+   }
+   ImVec2 overlay_size = ImGui::CalcTextSize(overlay, NULL);
+
+   float overlay_x = 0.f;
+   float mid_x = 0.5f * (bb.Min.x + bb.Max.x);
+   if(fraction < 0) 
+   {
+      fraction = 1.f+fraction;
+      float min_x = ImLerp(bb.Min.x, mid_x, fraction);
+      window->DrawList->AddRectFilled(ImVec2(min_x, bb.Min.y), ImVec2(mid_x, bb.Max.y), ImGui::GetColorU32(ImGuiCol_PlotHistogram), 0.0f);
+
+      overlay_x = ImClamp(min_x - style.ItemSpacing.x - overlay_size.x, bb.Min.x, mid_x);
+   }
+   else if (fraction > 0) {
+      float max_x = ImLerp(mid_x, bb.Max.x, fraction);
+      window->DrawList->AddRectFilled(ImVec2(mid_x, bb.Min.y), ImVec2(max_x, bb.Max.y), ImGui::GetColorU32(ImGuiCol_PlotHistogram), 0.0f);
+
+      overlay_x = ImClamp(max_x + style.ItemSpacing.x, mid_x, bb.Max.x - overlay_size.x - style.ItemInnerSpacing.x);
+   }
+   
+   if (overlay_size.x > 0.0f)
+      ImGui::RenderTextClipped(ImVec2(overlay_x, bb.Min.y), bb.Max, overlay, NULL, &overlay_size, ImVec2(0.0f,0.5f), &bb);
+}
+
 static void compute_swapchain_display(struct swapchain_data *data)
 {
    struct device_data *device_data = data->device;
@@ -667,10 +865,12 @@ static void compute_swapchain_display(struct swapchain_data *data)
 
       ImGui::Separator();
 
-      int seconds = instance_data->telemetry_data.lap_time;
+      int seconds = ((int)instance_data->telemetry_data.lap_time) % 60;
       int millis = ((int)(instance_data->telemetry_data.lap_time * 1000.f)) % 1000;
       int minutes = ((int)(instance_data->telemetry_data.lap_time / 60.f)) % 60;
-      ImGui::Text("Time: %02d:%02d.%03d", minutes, seconds, millis);
+      ImGui::PushFont(data->big_font);
+      ImGui::Text("%02d:%02d.%03d", minutes, seconds, millis);
+      ImGui::PopFont();
 
       float track_progress = 0;
       if(instance_data->telemetry_data.track_length > 0) 
@@ -684,49 +884,42 @@ static void compute_swapchain_display(struct swapchain_data *data)
       ImGui::Separator();
 
       int gear = (int)instance_data->telemetry_data.gear;
-      if (gear < 0) 
-      {
-         ImGui::Text("Gear: R");
-      }
-      else
-      {
-         ImGui::Text("Gear: %d", gear);
-      }
-
-      float rpm_progress = 0;
+      float speed = instance_data->telemetry_data.speed * 3.6f;
+      float rpm_progress = 0.0f;
       if (instance_data->telemetry_data.max_rpm > 0)
       {
          rpm_progress = instance_data->telemetry_data.rpm / instance_data->telemetry_data.max_rpm;
       }
-      ImGui::ProgressBar(rpm_progress, ImVec2(0.0f, 0.0f), "");
-      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
-      ImGui::Text("%4.0f RPM", instance_data->telemetry_data.rpm * 10.f);
-
-      ImGui::Text("%3.0f km/h", instance_data->telemetry_data.speed * 3.6f);
+      RPMGauge(rpm_progress, ImVec2(0.0f, 0.0f), 0.f, instance_data->telemetry_data.max_rpm, 100.f, "%1.0f", gear, speed, data->big_font);
 
       ImGui::Separator();
 
-      //TODO: gotta make our own Vertical Progress Bar! (see Vertical Slider)
-      ImGui::ProgressBar(instance_data->telemetry_data.clutch, ImVec2(0.0f,0.0f), "");
-      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
-      ImGui::Text("Clutch");
+      //COLUMNS ARE BACKWARDS, RIGHT TO LEFT
+      ImGui::Columns(3);
+      {
+         VerticalProgressBar(instance_data->telemetry_data.throttle, ImVec2(0.0f,0.0f));
+         ImGui::Text("Throttle");
 
-      ImGui::ProgressBar(instance_data->telemetry_data.brake, ImVec2(0.0f,0.0f), "");
-      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
-      ImGui::Text("Brake");
+         ImGui::NextColumn();
 
-      ImGui::ProgressBar(instance_data->telemetry_data.throttle, ImVec2(0.0f,0.0f), "");
-      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
-      ImGui::Text("Throttle");
+         VerticalProgressBar(instance_data->telemetry_data.brake, ImVec2(0.0f,0.0f));
+         ImGui::Text("Brake");
 
-      ImGui::SliderFloat("Steering", &instance_data->telemetry_data.steering, -1.0, 1.0, "");
+         ImGui::NextColumn();
+
+         VerticalProgressBar(instance_data->telemetry_data.clutch, ImVec2(0.0f,0.0f));
+         ImGui::Text("Clutch");   
+      }
+      ImGui::Columns(1);
+
+      MiddleProgressBar(instance_data->telemetry_data.steering, ImVec2(0.0f,0.0f));
 
       //you can do text without color, and without push / pop font too!
 
       //theres an Imgui::PlotLines() !!
 
       //auto-resize of window!
-      //data->window_size = ImVec2(ImGui::GetCursorPosX() + 10.0f, ImGui::GetCursorPosY() + 10.0f);
+      data->window_size = ImVec2(data->window_size.x, ImGui::GetCursorPosY() + 10.0f);
    }
    ImGui::End();
 
@@ -1327,8 +1520,9 @@ static void setup_swapchain_data_pipeline(struct swapchain_data *data)
    const char* ttf_compressed_base85 = GetDefaultCompressedFontDataTTFBase85();
    const ImWchar* glyph_ranges = io.Fonts->GetGlyphRangesDefault();
 
-   data->font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, font_size, &font_cfg, glyph_ranges);
-   data->font1 = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, font_size * 0.55, &font_cfg, glyph_ranges);
+   data->small_font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, 16, &font_cfg, glyph_ranges);
+   data->medium_font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, 48, &font_cfg, glyph_ranges);
+   data->big_font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, 64, &font_cfg, glyph_ranges);
    
    unsigned char* pixels;
    int width, height;
