@@ -2,9 +2,9 @@
 OS_RELEASE_FILES=("/etc/os-release" "/usr/lib/os-release")
 XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-DATA_DIR="$XDG_DATA_HOME/MangoHud"
-LAYER="build/release/usr/share/vulkan/implicit_layer.d/mangohud.json"
-INSTALL_DIR="build/package/MangoHud"
+DATA_DIR="$XDG_DATA_HOME/DiRTHud"
+LAYER="build/release/usr/share/vulkan/implicit_layer.d/DiRThud.json"
+INSTALL_DIR="build/package/DiRTHud"
 IMPLICIT_LAYER_DIR="$XDG_DATA_HOME/vulkan/implicit_layer.d"
 VERSION=$(git describe --long --tags --always | sed 's/\([^-]*-g\)/r\1/;s/-/./g;s/^v//')
 
@@ -17,7 +17,7 @@ for os_release in ${OS_RELEASE_FILES[@]} ; do
 done
 
 dependencies() {
-    if [[ ! -f build/release/usr/lib64/libMangoHud.so ]]; then
+    if [[ ! -f build/release/usr/lib64/libDiRTHud.so ]]; then
         missing_deps() {
             echo "# Missing dependencies:$INSTALL"
             read -rp "Do you wish the script to install these packages? [y/N]" PERMISSION
@@ -129,39 +129,39 @@ build() {
 }
 
 package() {
-    LIB="build/release/usr/lib64/libMangoHud.so"
-    LIB32="build/release/usr/lib32/libMangoHud.so"
-    if [[ ! -f "$LIB" || "$LIB" -ot "build/meson64/src/libMangoHud.so" ]]; then
+    LIB="build/release/usr/lib64/libDiRTHud.so"
+    LIB32="build/release/usr/lib32/libDiRTHud.so"
+    if [[ ! -f "$LIB" || "$LIB" -ot "build/meson64/src/libDiRTHud.so" ]]; then
         build
     fi
-    mkdir -p "$INSTALL_DIR/.local/share/"{MangoHud,vulkan/implicit_layer.d}
-    mkdir -p "$INSTALL_DIR/.config/MangoHud"
+    mkdir -p "$INSTALL_DIR/.local/share/"{DiRTHud,vulkan/implicit_layer.d}
+    mkdir -p "$INSTALL_DIR/.config/DiRTHud"
 
-    cp "$LIB32" "$INSTALL_DIR/.local/share/MangoHud/libMangoHud32.so"
-    cp "$LIB" "$INSTALL_DIR/.local/share/MangoHud/libMangoHud.so"
-    cp "$LAYER" "$INSTALL_DIR/.local/share/vulkan/implicit_layer.d/mangohud64.json"
-    cp "$LAYER" "$INSTALL_DIR/.local/share/vulkan/implicit_layer.d/mangohud32.json"
-    cp --preserve=mode "bin/install.sh" "build/package/MangoHud/install.sh"
-    cp "bin/MangoHud.conf" "$INSTALL_DIR/.config/MangoHud/MangoHud.conf"
-    cp "bin/MangoHud.conf" "$INSTALL_DIR/.local/share/MangoHud/MangoHud.conf"
-    sed -i "s|64bit|32bit|g" "$INSTALL_DIR/.local/share/vulkan/implicit_layer.d/mangohud32.json"
+    cp "$LIB32" "$INSTALL_DIR/.local/share/DiRTHud/libDiRTHud32.so"
+    cp "$LIB" "$INSTALL_DIR/.local/share/DiRTHud/libDiRTHud.so"
+    cp "$LAYER" "$INSTALL_DIR/.local/share/vulkan/implicit_layer.d/DiRThud64.json"
+    cp "$LAYER" "$INSTALL_DIR/.local/share/vulkan/implicit_layer.d/DiRThud32.json"
+    cp --preserve=mode "bin/install.sh" "build/package/DiRTHud/install.sh"
+    cp "bin/DiRTHud.conf" "$INSTALL_DIR/.config/DiRTHud/DiRTHud.conf"
+    cp "bin/DiRTHud.conf" "$INSTALL_DIR/.local/share/DiRTHud/DiRTHud.conf"
+    sed -i "s|64bit|32bit|g" "$INSTALL_DIR/.local/share/vulkan/implicit_layer.d/DiRThud32.json"
 
-    tar -C build/package -cpzf "build/MangoHud-$VERSION.tar.gz" .
+    tar -C build/package -cpzf "build/DiRTHud-$VERSION.tar.gz" .
 }
 
 install() {
-    PKG="build/MangoHud-$VERSION.tar.gz"
-    if [[ ! -f "$PKG" || "$PKG" -ot "build/meson64/src/libMangoHud.so" ]]; then
+    PKG="build/DiRTHud-$VERSION.tar.gz"
+    if [[ ! -f "$PKG" || "$PKG" -ot "build/meson64/src/libDiRTHud.so" ]]; then
         package
     fi
-    if [[ -f "$XDG_CONFIG_HOME/MangoHud/MangoHud.conf" ]]; then
-        tar xzf "build/MangoHud-$VERSION.tar.gz" -C "$XDG_DATA_HOME/" "./MangoHud/.local/share/"{MangoHud,vulkan} --strip-components=4
+    if [[ -f "$XDG_CONFIG_HOME/DiRTHud/DiRTHud.conf" ]]; then
+        tar xzf "build/DiRTHud-$VERSION.tar.gz" -C "$XDG_DATA_HOME/" "./DiRTHud/.local/share/"{DiRTHud,vulkan} --strip-components=4
     else
-        tar xzf "build/MangoHud-$VERSION.tar.gz" -C "$XDG_DATA_HOME/" "./MangoHud/.local/share/"{MangoHud,vulkan} --strip-components=4
-        tar xzf "build/MangoHud-$VERSION.tar.gz" -C "$XDG_CONFIG_HOME/" "./MangoHud/.config/MangoHud" --strip-components=3
+        tar xzf "build/DiRTHud-$VERSION.tar.gz" -C "$XDG_DATA_HOME/" "./DiRTHud/.local/share/"{DiRTHud,vulkan} --strip-components=4
+        tar xzf "build/DiRTHud-$VERSION.tar.gz" -C "$XDG_CONFIG_HOME/" "./DiRTHud/.config/DiRTHud" --strip-components=3
     fi
-    sed -i "s|libMangoHud.so|$XDG_DATA_HOME/MangoHud/libMangoHud32.so|g" "$XDG_DATA_HOME/vulkan/implicit_layer.d/mangohud32.json"
-    sed -i "s|libMangoHud.so|$XDG_DATA_HOME/MangoHud/libMangoHud.so|g" "$XDG_DATA_HOME/vulkan/implicit_layer.d/mangohud64.json"
+    sed -i "s|libDiRTHud.so|$XDG_DATA_HOME/DiRTHud/libDiRTHud32.so|g" "$XDG_DATA_HOME/vulkan/implicit_layer.d/DiRThud32.json"
+    sed -i "s|libDiRTHud.so|$XDG_DATA_HOME/DiRTHud/libDiRTHud.so|g" "$XDG_DATA_HOME/vulkan/implicit_layer.d/DiRThud64.json"
 }
 
 clean() {
@@ -169,8 +169,8 @@ clean() {
 }
 
 uninstall() {
-    rm -rfv "$XDG_DATA_HOME/MangoHud"
-    rm -fv "$IMPLICIT_LAYER_DIR"/{mangohud64,mangohud32}.json
+    rm -rfv "$XDG_DATA_HOME/DiRTHud"
+    rm -fv "$IMPLICIT_LAYER_DIR"/{DiRThud64,DiRThud32}.json
 }
 
 for a in $@; do

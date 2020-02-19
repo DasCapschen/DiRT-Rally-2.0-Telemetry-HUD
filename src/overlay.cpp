@@ -27,13 +27,21 @@
 #include <thread>
 #include <chrono>
 #include <unordered_map>
+#include <vector>
+
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
 #include "imgui.h"
 
-#include "overlay_params.h"
 #include "font_default.h"
 
 // #include "util/debug.h"
@@ -47,20 +55,12 @@
 #include "vk_enum_to_str.h"
 #include <vulkan/vk_util.h>
 
-#include "string_utils.h"
-#include "file_utils.h"
-#include "cpu_gpu.h"
-#include "logging.h"
-#include "keybinds.h"
-#include "cpu.h"
-#include "loaders/loader_nvml.h"
+#include "telemetry.h"
 
-bool open = false;
-string gpuString;
+bool is_open = false;
 float offset_x, offset_y, hudSpacing;
 int hudFirstRow, hudSecondRow;
-string engineName, engineVersion;
-struct amdGpu amdgpu;
+std::string engineName, engineVersion;
 int64_t frameStart, frameEnd, targetFrameTime = 0, frameOverhead = 0, sleepTime = 0;
 
 #define RGBGetBValue(rgb)   (rgb & 0x000000FF)
@@ -74,22 +74,12 @@ struct instance_data {
    struct vk_instance_dispatch_table vtable;
    VkInstance instance;
 
-   struct overlay_params params;
    bool pipeline_statistics_enabled;
 
    bool first_line_printed;
 
-   int control_client;
-
-   /* Dumping of frame stats to a file has been enabled. */
-   bool capture_enabled;
-
-   /* Dumping of frame stats to a file has been enabled and started. */
-   bool capture_started;
-};
-
-struct frame_stat {
-   uint64_t stats[OVERLAY_PARAM_ENABLED_MAX];
+   int socket;
+   TelemetryStruct telemetry_data;
 };
 
 /* Mapped from VkDevice */
@@ -109,10 +99,6 @@ struct device_data {
 
    struct queue_data **queues;
    uint32_t n_queues;
-
-   /* For a single frame */
-   struct frame_stat frame_stats;
-   bool gpu_stats = false;
 };
 
 /* Mapped from VkCommandBuffer */
@@ -124,8 +110,6 @@ struct command_buffer_data {
    VkCommandBuffer cmd_buffer;
    VkQueryPool timestamp_query_pool;
    uint32_t query_index;
-
-   struct frame_stat stats;
 
    struct list_head link; /* link into queue_data::running_command_buffer */
 };
@@ -204,26 +188,6 @@ struct swapchain_data {
 
    /**/
    uint64_t n_frames;
-   uint64_t last_present_time;
-
-   unsigned n_frames_since_update;
-   uint64_t last_fps_update;
-   double fps;
-   double frametime;
-   double frametimeDisplay;
-   const char* cpuString;
-   const char* gpuString;
-
-   enum overlay_param_enabled stat_selector;
-   double time_dividor;
-   struct frame_stat stats_min, stats_max;
-   struct frame_stat frames_stats[200];
-
-   /* Over a single frame */
-   struct frame_stat frame_stats;
-
-   /* Over fps_sampling_period */
-   struct frame_stat accumulated_stats;
 };
 
 static const VkQueryPipelineStatisticFlags overlay_query_flags =
@@ -353,17 +317,15 @@ static struct instance_data *new_instance_data(VkInstance instance)
 {
    struct instance_data *data = new instance_data();
    data->instance = instance;
-   data->control_client = -1;
+   data->socket = -1;
+   data->telemetry_data = {0};
    map_object(HKEY(data->instance), data);
    return data;
 }
 
 static void destroy_instance_data(struct instance_data *data)
 {
-   if (data->params.output_file)
-      fclose(data->params.output_file);
-   if (data->params.control >= 0)
-      os_socket_close(data->params.control);
+   //remember to destroy our data here
    unmap_object(HKEY(data->instance));
    delete data;
 }
@@ -520,7 +482,7 @@ static struct swapchain_data *new_swapchain_data(VkSwapchainKHR swapchain,
    struct swapchain_data *data = rzalloc(NULL, struct swapchain_data);
    data->device = device_data;
    data->swapchain = swapchain;
-   data->window_size = ImVec2(instance_data->params.width, instance_data->params.height);
+   data->window_size = ImVec2(300, 300); //used to be instancedata->params.width/height
    list_inithead(&data->draws);
    map_object(HKEY(data->swapchain), data);
    return data;
@@ -578,544 +540,112 @@ struct overlay_draw *get_overlay_draw(struct swapchain_data *data)
    return draw;
 }
 
-static const char *param_unit(enum overlay_param_enabled param)
+
+
+static void udp_socket_disconnected(struct instance_data *instance_data)
 {
-   switch (param) {
-   case OVERLAY_PARAM_ENABLED_frame_timing:
-   case OVERLAY_PARAM_ENABLED_present_timing:
-      return "(us)";
-   case OVERLAY_PARAM_ENABLED_gpu_timing:
-      return "(ns)";
-   default:
-      return "";
-   }
+   close(instance_data->socket);
+   instance_data->socket = -1;
 }
 
-static void parse_command(struct instance_data *instance_data,
-                          const char *cmd, unsigned cmdlen,
-                          const char *param, unsigned paramlen)
-{
-   if (!strncmp(cmd, "capture", cmdlen)) {
-      int value = atoi(param);
-      bool enabled = value > 0;
-
-      if (enabled) {
-         instance_data->capture_enabled = true;
-      } else {
-         instance_data->capture_enabled = false;
-         instance_data->capture_started = false;
-      }
-   }
-}
-
-#define BUFSIZE 4096
-
-/**
- * This function will process commands through the control file.
- *
- * A command starts with a colon, followed by the command, and followed by an
- * option '=' and a parameter.  It has to end with a semi-colon. A full command
- * + parameter looks like:
- *
- *    :cmd=param;
- */
-static void process_char(struct instance_data *instance_data, char c)
-{
-   static char cmd[BUFSIZE];
-   static char param[BUFSIZE];
-
-   static unsigned cmdpos = 0;
-   static unsigned parampos = 0;
-   static bool reading_cmd = false;
-   static bool reading_param = false;
-
-   switch (c) {
-   case ':':
-      cmdpos = 0;
-      parampos = 0;
-      reading_cmd = true;
-      reading_param = false;
-      break;
-   case ';':
-      if (!reading_cmd)
-         break;
-      cmd[cmdpos++] = '\0';
-      param[parampos++] = '\0';
-      parse_command(instance_data, cmd, cmdpos, param, parampos);
-      reading_cmd = false;
-      reading_param = false;
-      break;
-   case '=':
-      if (!reading_cmd)
-         break;
-      reading_param = true;
-      break;
-   default:
-      if (!reading_cmd)
-         break;
-
-      if (reading_param) {
-         /* overflow means an invalid parameter */
-         if (parampos >= BUFSIZE - 1) {
-            reading_cmd = false;
-            reading_param = false;
-            break;
-         }
-
-         param[parampos++] = c;
-      } else {
-         /* overflow means an invalid command */
-         if (cmdpos >= BUFSIZE - 1) {
-            reading_cmd = false;
-            break;
-         }
-
-         cmd[cmdpos++] = c;
-      }
-   }
-}
-
-static void control_send(struct instance_data *instance_data,
-                         const char *cmd, unsigned cmdlen,
-                         const char *param, unsigned paramlen)
-{
-   unsigned msglen = 0;
-   char buffer[BUFSIZE];
-
-   assert(cmdlen + paramlen + 3 < BUFSIZE);
-
-   buffer[msglen++] = ':';
-
-   memcpy(&buffer[msglen], cmd, cmdlen);
-   msglen += cmdlen;
-
-   if (paramlen > 0) {
-      buffer[msglen++] = '=';
-      memcpy(&buffer[msglen], param, paramlen);
-      msglen += paramlen;
-      buffer[msglen++] = ';';
-   }
-
-   os_socket_send(instance_data->control_client, buffer, msglen, 0);
-}
-
-static void control_send_connection_string(struct device_data *device_data)
+//control client == some sort of socket!! -> useful for us!
+static void udp_socket_check(struct device_data *device_data)
 {
    struct instance_data *instance_data = device_data->instance;
 
-   const char *controlVersionCmd = "MesaOverlayControlVersion";
-   const char *controlVersionString = "1";
-
-   control_send(instance_data, controlVersionCmd, strlen(controlVersionCmd),
-                controlVersionString, strlen(controlVersionString));
-
-   const char *deviceCmd = "DeviceName";
-   const char *deviceName = device_data->properties.deviceName;
-
-   control_send(instance_data, deviceCmd, strlen(deviceCmd),
-                deviceName, strlen(deviceName));
-
-   const char *mesaVersionCmd = "MesaVersion";
-   const char *mesaVersionString = "Mesa " PACKAGE_VERSION;
-
-   control_send(instance_data, mesaVersionCmd, strlen(mesaVersionCmd),
-                mesaVersionString, strlen(mesaVersionString));
-}
-
-static void control_client_check(struct device_data *device_data)
-{
-   struct instance_data *instance_data = device_data->instance;
-
-   /* Already connected, just return. */
-   if (instance_data->control_client >= 0)
+   // Already connected, just return.
+   if (instance_data->socket >= 0)
       return;
 
-   int socket = os_socket_accept(instance_data->params.control);
-   if (socket == -1) {
+   int s = socket(AF_INET, SOCK_DGRAM, 0);
+   if (s == -1) {
       if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ECONNABORTED)
          fprintf(stderr, "ERROR on socket: %s\n", strerror(errno));
       return;
    }
 
-   if (socket >= 0) {
-      os_socket_block(socket, false);
-      instance_data->control_client = socket;
-      control_send_connection_string(device_data);
+   sockaddr_in addr = {0};
+   addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+   addr.sin_port = htons(20777);
+   addr.sin_family = AF_INET;
+
+   int res = bind(s, (sockaddr*)&addr, sizeof(addr));
+   if (res < 0) {
+      fprintf(stderr, "ERROR on bind: %s\n", strerror(errno));
+      return;
+   }
+
+   if (res >= 0) {
+      int old = fcntl(s, F_GETFL, 0);
+      if (old == -1)
+         return;
+
+      fcntl(s, F_SETFL, old | O_NONBLOCK);
+      instance_data->socket = s;
    }
 }
 
-static void control_client_disconnected(struct instance_data *instance_data)
-{
-   os_socket_close(instance_data->control_client);
-   instance_data->control_client = -1;
-}
+#define BUFSIZE 264
 
-static void process_control_socket(struct instance_data *instance_data)
+static void process_udp_socket(struct instance_data *instance_data)
 {
-   const int client = instance_data->control_client;
+   const int client = instance_data->socket;
    if (client >= 0) {
       char buf[BUFSIZE];
+      ssize_t n = 0;
 
       while (true) {
-         ssize_t n = os_socket_recv(client, buf, BUFSIZE, 0);
+         n = recv(client, buf, BUFSIZE, 0);
 
          if (n == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-               /* nothing to read, try again later */
+               // nothing to read, try again later
                break;
             }
 
             if (errno != ECONNRESET)
                fprintf(stderr, "ERROR on connection: %s\n", strerror(errno));
 
-            control_client_disconnected(instance_data);
+            udp_socket_disconnected(instance_data);
          } else if (n == 0) {
-            /* recv() returns 0 when the client disconnects */
-            control_client_disconnected(instance_data);
+            // recv() returns 0 when the client disconnects
+            udp_socket_disconnected(instance_data);
          }
 
-         for (ssize_t i = 0; i < n; i++) {
-            process_char(instance_data, buf[i]);
-         }
-
-         /* If we try to read BUFSIZE and receive BUFSIZE bytes from the
-          * socket, there's a good chance that there's still more data to be
-          * read, so we will try again. Otherwise, simply be done for this
-          * iteration and try again on the next frame.
-          */
-         if (n < BUFSIZE)
+         // If we try to read BUFSIZE and receive BUFSIZE bytes from the
+         // socket, there's a good chance that there's still more data to be
+         // read, so we will try again. Otherwise, simply be done for this
+         // iteration and try again on the next frame.
+         if (n <= BUFSIZE)
             break;
       }
-   }
-}
 
-void init_gpu_stats(struct device_data *device_data)
-{
-   struct instance_data *instance_data = device_data->instance;
-
-   // NVIDIA or Intel but maybe has Optimus
-   if (device_data->properties.vendorID == 0x8086
-      || device_data->properties.vendorID == 0x10de) {
-      if ((device_data->gpu_stats = checkNvidia())) {
-         device_data->properties.vendorID = 0x10de;
+      if(n > 0) 
+      {
+         printf("setting telemetry data\n");
+         instance_data->telemetry_data = telemetry_from_buffer(buf);
       }
+      
    }
-
-   if (device_data->properties.vendorID == 0x8086
-       || device_data->properties.vendorID == 0x1002
-       || gpu.find("Radeon") != std::string::npos
-       || gpu.find("AMD") != std::string::npos) {
-      string path;
-      string drm = "/sys/class/drm/";
-
-      auto dirs = ls(drm.c_str(), "card");
-      for (auto& dir : dirs) {
-         path = drm + dir;
-
-#ifndef NDEBUG
-         std::cerr << "amdgpu path check: " << path << "/device/vendor" << std::endl;
-#endif
-
-         string line = read_line(path + "/device/vendor");
-         trim(line);
-         if (line != "0x1002")
-            continue;
-
-#ifndef NDEBUG
-           std::cerr << "using amdgpu path: " << path << std::endl;
-#endif
-
-         if (file_exists(path + "/device/gpu_busy_percent")) {
-            if (!amdGpuFile)
-               amdGpuFile = fopen((path + "/device/gpu_busy_percent").c_str(), "r");
-            if (!amdGpuVramTotalFile)
-               amdGpuVramTotalFile = fopen((path + "/device/mem_info_vram_total").c_str(), "r");
-            if (!amdGpuVramUsedFile)
-               amdGpuVramUsedFile = fopen((path + "/device/mem_info_vram_used").c_str(), "r");
-
-            path = path + "/device/hwmon/";
-            string tempFolder;
-            if (find_folder(path, "hwmon", tempFolder)) {
-               path = path + tempFolder + "/temp1_input";
-
-               if (!amdTempFile)
-                  amdTempFile = fopen(path.c_str(), "r");
-
-               device_data->gpu_stats = true;
-               device_data->properties.vendorID = 0x1002;
-               break;
-            }
-         }
-      }
-
-      // don't bother then
-      if (!amdGpuFile && !amdTempFile && !amdGpuVramTotalFile && !amdGpuVramUsedFile) {
-         device_data->gpu_stats = false;
-      }
-   }
-}
-
-static void snapshot_swapchain_frame(struct swapchain_data *data)
-{
-   struct device_data *device_data = data->device;
-   struct instance_data *instance_data = device_data->instance;
-   uint32_t f_idx = data->n_frames % ARRAY_SIZE(data->frames_stats);
-   uint64_t now = os_time_get(); /* us */
-
-   if (instance_data->params.control >= 0) {
-      control_client_check(device_data);
-      process_control_socket(instance_data);
-   }
-
-   double elapsed = (double)(now - data->last_fps_update); /* us */
-   elapsedF2 = (double)(now - last_f2_press);
-   elapsedF12 = (double)(now - last_f12_press);
-   elapsedRefreshConfig = (double)(now - refresh_config_press);
-   fps = 1000000.0f * data->n_frames_since_update / elapsed;
-
-   if (data->last_present_time) {
-      data->frame_stats.stats[OVERLAY_PARAM_ENABLED_frame_timing] =
-         now - data->last_present_time;
-   }
-
-   memset(&data->frames_stats[f_idx], 0, sizeof(data->frames_stats[f_idx]));
-   for (int s = 0; s < OVERLAY_PARAM_ENABLED_MAX; s++) {
-      data->frames_stats[f_idx].stats[s] += device_data->frame_stats.stats[s] + data->frame_stats.stats[s];
-      data->accumulated_stats.stats[s] += device_data->frame_stats.stats[s] + data->frame_stats.stats[s];
-   }
-
-   if (elapsedF2 >= 500000 && mangohud_output_env){
-     if (key_is_pressed(instance_data->params.toggle_logging)){
-       last_f2_press = now;
-       log_start = now;
-       loggingOn = !loggingOn;
-
-       if (loggingOn && log_period != 0)
-         pthread_create(&f2, NULL, &logging, NULL);
-
-     }
-   }
-
-   if (elapsedF12 >= 500000){
-      if (key_is_pressed(instance_data->params.toggle_hud)){
-         instance_data->params.no_display = !instance_data->params.no_display;
-         last_f12_press = now;
-      }
-   }
-
-   if (elapsedRefreshConfig >= 500000){
-      if (key_is_pressed(instance_data->params.refresh_config)){
-         parse_overlay_config(&instance_data->params, getenv("MANGOHUD_CONFIG"));
-         refresh_config_press = now;
-      }
-   }
-
-   if (!sysInfoFetched) {
-      ram =  exec("cat /proc/meminfo | grep 'MemTotal' | awk '{print $2}'");
-      trim(ram);
-      cpu =  exec("cat /proc/cpuinfo | grep 'model name' | tail -n1 | sed 's/^.*: //' | sed 's/([^)]*)/()/g' | tr -d '(/)'");
-      trim(cpu);
-      kernel = exec("uname -r");
-      trim(kernel);
-      os = exec("cat /etc/*-release | grep 'PRETTY_NAME' | cut -d '=' -f 2-");
-      os.erase(remove(os.begin(), os.end(), '\"' ), os.end());
-      trim(os);
-      gpu = exec("lspci | grep VGA | head -n1 | awk -vRS=']' -vFS='[' '{print $2}' | sed '/^$/d' | tail -n1");
-      trim(gpu);
-      driver = exec("glxinfo | grep 'OpenGL version' | sed 's/^.*: //' | cut -d' ' --output-delimiter=$'\n' -f1- | grep -v '(' | grep -v ')' | tr '\n' ' ' | cut -c 1-");
-      trim(driver);
-      //driver = itox(device_data->properties.driverVersion);
-
-#ifndef NDEBUG
-      std::cout << "Ram:" << ram << "\n"
-                << "Cpu:" << cpu << "\n"
-                << "Kernel:" << kernel << "\n"
-                << "Os:" << os << "\n"
-                << "Gpu:" << gpu << "\n"
-                << "Driver:" << driver << std::endl;
-#endif
-
-      if (!log_period_env || !try_stoi(log_period, log_period_env))
-        log_period = 100;
-
-      if (log_period == 0)
-         out.open("/tmp/mango", ios::out | ios::app);
-
-      if (log_duration_env && !try_stoi(duration, log_duration_env))
-        duration = 0;
-
-      if (cpu.find("Intel") != std::string::npos) {
-         string path;
-         if (find_folder("/sys/devices/platform/coretemp.0/hwmon/", "hwmon", path)) {
-           path = "/sys/devices/platform/coretemp.0/hwmon/" + path + "/temp1_input";
-           if (file_exists(path))
-              cpuTempFile = fopen(path.c_str(), "r");
-         }
-      } else {
-         string name, path;
-         string hwmon = "/sys/class/hwmon/";
-         auto dirs = ls(hwmon.c_str());
-         for (auto& dir : dirs)
-         {
-            path = hwmon + dir;
-            name = read_line(path + "/name");
-            std::cerr << "hwmon: sensor name: " << name << std::endl;
-            if (name == "k10temp" || name == "zenpower"){
-               path += "/temp1_input";
-               break;
-            }
-         }
-         if (!file_exists(path)) {
-            cout << "MANGOHUD: Could not find temp location" << endl;
-         } else {
-            cpuTempFile = fopen(path.c_str(), "r");
-         }
-      }
-
-      sysInfoFetched = true;
-   }
-
-   /* If capture has been enabled but it hasn't started yet, it means we are on
-    * the first snapshot after it has been enabled. At this point we want to
-    * use the stats captured so far to update the display, but we don't want
-    * this data to cause noise to the stats that we want to capture from now
-    * on.
-    *
-    * capture_begin == true will trigger an update of the fps on display, and a
-    * flush of the data, but no stats will be written to the output file. This
-    * way, we will have only stats from after the capture has been enabled
-    * written to the output_file.
-    */
-   const bool capture_begin =
-      instance_data->capture_enabled && !instance_data->capture_started;
-
-   if (data->last_fps_update) {
-      if (capture_begin ||
-          elapsed >= instance_data->params.fps_sampling_period) {
-            cpuStats.UpdateCPUData();
-            cpuLoadLog = cpuStats.GetCPUDataTotal().percent;
-            if (cpuTempFile)
-              pthread_create(&cpuInfoThread, NULL, &cpuInfo, NULL);
-            
-            if (device_data->gpu_stats) {
-              // get gpu usage
-              if (device_data->properties.vendorID == 0x10de)
-                 pthread_create(&gpuThread, NULL, &getNvidiaGpuInfo, NULL);
-
-              if (device_data->properties.vendorID == 0x1002)
-                pthread_create(&gpuThread, NULL, &getAmdGpuUsage, NULL);
-            }
-
-            // get ram usage/max
-            pthread_create(&memoryThread, NULL, &update_meminfo, NULL);
-
-            // update variables for logging
-            // cpuLoadLog = cpuArray[0].value;
-            gpuLoadLog = gpuLoad;
-
-            data->frametimeDisplay = data->frametime;
-            data->fps = fps;
-         if (instance_data->capture_started) {
-            if (!instance_data->first_line_printed) {
-               bool first_column = true;
-
-               instance_data->first_line_printed = true;
-
-#define OVERLAY_PARAM_BOOL(name) \
-               if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_##name]) { \
-                  fprintf(instance_data->params.output_file, \
-                          "%s%s%s", first_column ? "" : ", ", #name, \
-                          param_unit(OVERLAY_PARAM_ENABLED_##name)); \
-                  first_column = false; \
-               }
-#define OVERLAY_PARAM_CUSTOM(name)
-               OVERLAY_PARAMS
-#undef OVERLAY_PARAM_BOOL
-#undef OVERLAY_PARAM_CUSTOM
-               fprintf(instance_data->params.output_file, "\n");
-            }
-
-            for (int s = 0; s < OVERLAY_PARAM_ENABLED_MAX; s++) {
-               if (!instance_data->params.enabled[s])
-                  continue;
-               if (s == OVERLAY_PARAM_ENABLED_fps) {
-                  fprintf(instance_data->params.output_file,
-                          "%s%.2f", s == 0 ? "" : ", ", data->fps);
-               } else {
-                  fprintf(instance_data->params.output_file,
-                          "%s%" PRIu64, s == 0 ? "" : ", ",
-                          data->accumulated_stats.stats[s]);
-               }
-            }
-            fprintf(instance_data->params.output_file, "\n");
-            fflush(instance_data->params.output_file);
-         }
-
-         memset(&data->accumulated_stats, 0, sizeof(data->accumulated_stats));
-         data->n_frames_since_update = 0;
-         data->last_fps_update = now;
-
-         if (capture_begin)
-            instance_data->capture_started = true;
-      }
-   } else {
-      data->last_fps_update = now;
-   }
-
-   memset(&device_data->frame_stats, 0, sizeof(device_data->frame_stats));
-   memset(&data->frame_stats, 0, sizeof(device_data->frame_stats));
-
-   data->last_present_time = now;
-   data->n_frames++;
-   data->n_frames_since_update++;
-}
-
-static float get_time_stat(void *_data, int _idx)
-{
-   struct swapchain_data *data = (struct swapchain_data *) _data;
-   if ((ARRAY_SIZE(data->frames_stats) - _idx) > data->n_frames)
-      return 0.0f;
-   int idx = ARRAY_SIZE(data->frames_stats) +
-      data->n_frames < ARRAY_SIZE(data->frames_stats) ?
-      _idx - data->n_frames :
-      _idx + data->n_frames;
-   idx %= ARRAY_SIZE(data->frames_stats);
-   /* Time stats are in us. */
-   return data->frames_stats[idx].stats[data->stat_selector] / data->time_dividor;
 }
 
 static void position_layer(struct swapchain_data *data)
-
 {
    struct device_data *device_data = data->device;
    struct instance_data *instance_data = device_data->instance;
    float margin = 10.0f;
-   if (instance_data->params.offset_x > 0 || instance_data->params.offset_y > 0)
-      margin = 0.0f;
+   //if (instance_data->params.offset_x > 0 || instance_data->params.offset_y > 0)
+   //   margin = 0.0f;
 
-   ImGui::SetNextWindowBgAlpha(instance_data->params.background_alpha);
+   ImGui::SetNextWindowBgAlpha(0.69); //instance_data->params.background_alpha
    ImGui::SetNextWindowSize(data->window_size, ImGuiCond_Always);
    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8,-3));
 
-   switch (instance_data->params.position) {
-   case LAYER_POSITION_TOP_LEFT:
-      ImGui::SetNextWindowPos(ImVec2(margin + instance_data->params.offset_x, margin + instance_data->params.offset_y), ImGuiCond_Always);
-      break;
-   case LAYER_POSITION_TOP_RIGHT:
-      ImGui::SetNextWindowPos(ImVec2(data->width - data->window_size.x - margin + instance_data->params.offset_x, margin + instance_data->params.offset_y),
-                              ImGuiCond_Always);
-      break;
-   case LAYER_POSITION_BOTTOM_LEFT:
-      ImGui::SetNextWindowPos(ImVec2(margin + instance_data->params.offset_x, data->height - data->window_size.y - margin + instance_data->params.offset_y),
-                              ImGuiCond_Always);
-      break;
-   case LAYER_POSITION_BOTTOM_RIGHT:
-      ImGui::SetNextWindowPos(ImVec2(data->width - data->window_size.x - margin + instance_data->params.offset_x,
-                                     data->height - data->window_size.y - margin + instance_data->params.offset_y),
-                              ImGuiCond_Always);
-      break;
-   }
+   //place window bottom right
+   ImGui::SetNextWindowPos(ImVec2(data->width - data->window_size.x - margin, // + offset_x
+                                  data->height - data->window_size.y - margin), // + offset_y
+                           ImGuiCond_Always);
 }
 
 static void compute_swapchain_display(struct swapchain_data *data)
@@ -1126,162 +656,75 @@ static void compute_swapchain_display(struct swapchain_data *data)
    ImGui::SetCurrentContext(data->imgui_context);
    ImGui::NewFrame();
    position_layer(data);
-   if (instance_data->params.font_size > 0 && instance_data->params.width == 280)
-      instance_data->params.width = hudFirstRow + hudSecondRow;
+   ImGui::PopStyleVar(2); //push happens in position_layer()
+   //if (instance_data->params.font_size > 0 && instance_data->params.width == 280)
+   //   instance_data->params.width = hudFirstRow + hudSecondRow;
 
-   if (!instance_data->params.no_display){
-      ImGui::Begin("Main", &open, ImGuiWindowFlags_NoDecoration);
-      if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_time]){
-         std::time_t t = std::time(nullptr);
-         std::stringstream time;
-         time << std::put_time(std::localtime(&t), "%T");
-         ImGui::PushFont(data->font1);
-         ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.00f), "%s", time.str().c_str());
-         ImGui::PopFont();
-      }
-      if (device_data->gpu_stats && instance_data->params.enabled[OVERLAY_PARAM_ENABLED_gpu_stats]){
-         ImGui::TextColored(ImVec4(0.180, 0.592, 0.384, 1.00f), "GPU");
-         ImGui::SameLine(hudFirstRow);
-         ImGui::Text("%i%%", gpuLoad);
-         // ImGui::SameLine(150);
-         // ImGui::Text("%s", "%");
-         if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_gpu_temp]){
-            ImGui::SameLine(hudSecondRow);
-            ImGui::Text("%i%s", gpuTemp, "°C");
-         }
-      }
-      if(instance_data->params.enabled[OVERLAY_PARAM_ENABLED_cpu_stats]){
-         ImGui::TextColored(ImVec4(0.180, 0.592, 0.796, 1.00f), "CPU");
-         ImGui::SameLine(hudFirstRow);
-         ImGui::Text("%d%%", cpuLoadLog);
-         // ImGui::SameLine(150);
-         // ImGui::Text("%s", "%");
-      
-         if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_cpu_temp]){
-            ImGui::SameLine(hudSecondRow);
-            ImGui::Text("%i%s", cpuTemp, "°C");
-         }
-      }
-      
-      if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_core_load]){
-         int i = 0;
-         for (const CPUData &cpuData : cpuStats.GetCPUData())
-         {
-            ImGui::TextColored(ImVec4(0.180, 0.592, 0.796, 1.00f), "CPU");
-            ImGui::SameLine(0, 1.0f);
-            ImGui::PushFont(data->font1);
-            ImGui::TextColored(ImVec4(0.180, 0.592, 0.796, 1.00f),"%i", i);
-            ImGui::PopFont();
-            ImGui::SameLine(hudFirstRow);
-            ImGui::Text("%i%%", int(cpuData.percent));
-            ImGui::SameLine(hudSecondRow);
-            ImGui::Text("%i", cpuData.mhz);
-            ImGui::SameLine(0, 1.0f);
-            ImGui::PushFont(data->font1);
-            ImGui::Text("MHz");
-            ImGui::PopFont();
-            i++;
-         }
-      }
-      if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_vram]){
-         ImGui::TextColored(ImVec4(0.678, 0.392, 0.756, 1.00f), "VRAM");
-         ImGui::SameLine(hudFirstRow);
-         ImGui::Text("%.2f", gpuMemUsed);
-         ImGui::SameLine(0,1.0f);
-         ImGui::PushFont(data->font1);
-         ImGui::Text("GB");
-         ImGui::PopFont();
-      }
-      if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_ram]){
-         ImGui::TextColored(ImVec4(0.760, 0.4, 0.576, 1.00f), "RAM");
-         ImGui::SameLine(hudFirstRow);
-         ImGui::Text("%.2f", memused);
-         ImGui::SameLine(0,1.0f);
-         ImGui::PushFont(data->font1);
-         ImGui::Text("GB");
-         ImGui::PopFont();
-      }
-      if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_fps]){
-         ImGui::TextColored(ImVec4(0.925, 0.411, 0.411, 1.00f), "%s", engineName.c_str());
-         ImGui::SameLine(hudFirstRow);
-         ImGui::Text("%.0f", data->fps);
-         ImGui::SameLine(0, 1.0f);
-         ImGui::PushFont(data->font1);
-         ImGui::Text("FPS");
-         ImGui::PopFont();
-         ImGui::SameLine(hudSecondRow);
-         ImGui::Text("%.1f", 1000 / data->fps);
-         ImGui::SameLine(0, 1.0f);
-         ImGui::PushFont(data->font1);
-         ImGui::Text("ms");
-         ImGui::PopFont();
-         if (engineName == "DXVK" || engineName == "VKD3D"){
-            ImGui::PushFont(data->font1);
-            ImGui::TextColored(ImVec4(0.925, 0.411, 0.411, 1.00f), "%s", engineVersion.c_str());
-            ImGui::PopFont();
-         }
-      }
+   /* DRAW IMGUI */
+   ImGui::Begin("Main", &is_open, ImGuiWindowFlags_NoDecoration);
+   {
+      //ImGui::PushFont(data->font1);
+      ImGui::Text("Socket Open: %d", instance_data->socket);
+      //ImGui::PopFont();
 
-      if (loggingOn && log_period == 0){
-         uint64_t now = os_time_get();
-         elapsedLog = (double)(now - log_start);
-         if ((elapsedLog) >= duration * 1000000)
-            loggingOn = false;
+      ImGui::Separator();
 
-         out << fps << "," <<  cpuLoadLog << "," << gpuLoadLog << "," << (now - log_start) << endl;
+      int seconds = instance_data->telemetry_data.lap_time;
+      int millis = ((int)(instance_data->telemetry_data.lap_time * 1000.f)) % 1000;
+      int minutes = ((int)(instance_data->telemetry_data.lap_time / 60.f)) % 60;
+      ImGui::Text("Time: %02d:%02d.%03d", minutes, seconds, millis);
+
+      float track_progress = 0;
+      if(instance_data->telemetry_data.track_length > 0) 
+      {
+         track_progress = instance_data->telemetry_data.lap_distance / instance_data->telemetry_data.track_length;
       }
+      ImGui::ProgressBar(track_progress, ImVec2(0.0f, 0.0f));
+      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+      ImGui::Text("Track Progress");
 
-      if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_frame_timing]){
-         ImGui::Dummy(ImVec2(0.0f, instance_data->params.font_size / 2));
-         ImGui::PushFont(data->font1);
-         ImGui::TextColored(ImVec4(0.925, 0.411, 0.411, 1.00f), "%s", "Frametime");
-         ImGui::PopFont();
+      ImGui::Separator();
+
+      ImGui::Text("Gear: %d", (int)instance_data->telemetry_data.gear);
+
+      float rpm_progress = 0;
+      if (instance_data->telemetry_data.max_rpm > 0)
+      {
+         rpm_progress = instance_data->telemetry_data.rpm / instance_data->telemetry_data.max_rpm;
       }
+      ImGui::ProgressBar(rpm_progress, ImVec2(0.0f, 0.0f), "");
+      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+      ImGui::Text("%4.0f RPM", instance_data->telemetry_data.rpm * 10.f);
 
-      for (uint32_t s = 0; s < OVERLAY_PARAM_ENABLED_MAX; s++) {
-         if (!instance_data->params.enabled[s] ||
-            s == OVERLAY_PARAM_ENABLED_fps ||
-            s == OVERLAY_PARAM_ENABLED_frame)
-            continue;
+      ImGui::Text("%3.0f km/h", instance_data->telemetry_data.speed);
 
-         char hash[40];
-         snprintf(hash, sizeof(hash), "##%s", overlay_param_names[s]);
-         data->stat_selector = (enum overlay_param_enabled) s;
-         data->time_dividor = 1000.0f;
-         if (s == OVERLAY_PARAM_ENABLED_gpu_timing)
-            data->time_dividor = 1000000.0f;
+      ImGui::Separator();
 
-         ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-         if (s == OVERLAY_PARAM_ENABLED_frame_timing) {
-            double min_time = 0.0f;
-            double max_time = 50.0f;
-            ImGui::PlotLines(hash, get_time_stat, data,
-                                 ARRAY_SIZE(data->frames_stats), 0,
-                                 NULL, min_time, max_time,
-                                 ImVec2(ImGui::GetContentRegionAvailWidth() - instance_data->params.font_size * 2.2, 50));
-         }
-         ImGui::PopStyleColor();
-      }
-      if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_frame_timing]){
-         ImGui::SameLine(0,1.0f);
-         ImGui::PushFont(data->font1);
-         ImGui::Text("%.1f ms", 1000 / data->fps);
-         ImGui::PopFont();
-      }
-      data->window_size = ImVec2(data->window_size.x, ImGui::GetCursorPosY() + 10.0f);
-      ImGui::End();
+      //TODO: gotta make our own Vertical Progress Bar! (see Vertical Slider)
+      ImGui::ProgressBar(instance_data->telemetry_data.clutch, ImVec2(0.0f,0.0f), "");
+      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+      ImGui::Text("Clutch");
+
+      ImGui::ProgressBar(instance_data->telemetry_data.brake, ImVec2(0.0f,0.0f), "");
+      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+      ImGui::Text("Brake");
+
+      ImGui::ProgressBar(instance_data->telemetry_data.throttle, ImVec2(0.0f,0.0f), "");
+      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+      ImGui::Text("Throttle");
+
+      ImGui::SliderFloat("Steering", &instance_data->telemetry_data.steering, -1.0, 1.0, "");
+
+      //you can do text without color, and without push / pop font too!
+
+      //theres an Imgui::PlotLines() !!
+
+      //auto-resize of window!
+      //data->window_size = ImVec2(ImGui::GetCursorPosX() + 10.0f, ImGui::GetCursorPosY() + 10.0f);
    }
-   if(loggingOn){
-      ImGui::SetNextWindowBgAlpha(0.0);
-      ImGui::SetNextWindowSize(ImVec2(instance_data->params.font_size * 13, instance_data->params.font_size * 13), ImGuiCond_Always);
-      ImGui::SetNextWindowPos(ImVec2(data->width - instance_data->params.font_size * 13,
-                                    0),
-                                    ImGuiCond_Always);
-      ImGui::Begin("Logging", &open, ImGuiWindowFlags_NoDecoration);
-      ImGui::Text("Logging...");
-      ImGui::Text("Elapsed: %isec", int((elapsedLog) / 1000000));
-      ImGui::End();
-   }
+   ImGui::End();
+
+   /* draw crosshair!? :O
    if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_crosshair]){
       ImGui::SetNextWindowBgAlpha(0.0);
       ImGui::SetNextWindowSize(ImVec2(data->width, data->height), ImGuiCond_Always);
@@ -1297,9 +740,10 @@ static void compute_swapchain_display(struct swapchain_data *data)
          RGBGetBValue(instance_data->params.crosshair_color), 255), 2.0f);
       ImGui::End();
    }
-      ImGui::PopStyleVar(2);
-      ImGui::EndFrame();
-      ImGui::Render();
+   */
+
+   ImGui::EndFrame();
+   ImGui::Render();
 }
 
 static uint32_t vk_memory_type(struct device_data *data,
@@ -1870,23 +1314,16 @@ static void setup_swapchain_data_pipeline(struct swapchain_data *data)
    device_data->vtable.DestroyShaderModule(device_data->device, frag_module, NULL);
 
    ImGuiIO& io = ImGui::GetIO();
-   int font_size = device_data->instance->params.font_size;
-   if (!font_size)
-      font_size = 24;
+   int font_size = 12;
 
-   const char* mangohud_font = getenv("MANGOHUD_FONT");
    // ImGui takes ownership of the data, no need to free it
-   if (mangohud_font && file_exists(mangohud_font)) {
-      data->font = io.Fonts->AddFontFromFileTTF(mangohud_font, font_size);
-      data->font1 = io.Fonts->AddFontFromFileTTF(mangohud_font, font_size * 0.55f);
-   } else {
-      ImFontConfig font_cfg = ImFontConfig();
-      const char* ttf_compressed_base85 = GetDefaultCompressedFontDataTTFBase85();
-      const ImWchar* glyph_ranges = io.Fonts->GetGlyphRangesDefault();
+   ImFontConfig font_cfg = ImFontConfig();
+   const char* ttf_compressed_base85 = GetDefaultCompressedFontDataTTFBase85();
+   const ImWchar* glyph_ranges = io.Fonts->GetGlyphRangesDefault();
 
-      data->font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, font_size, &font_cfg, glyph_ranges);
-      data->font1 = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, font_size * 0.55, &font_cfg, glyph_ranges);
-   }
+   data->font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, font_size, &font_cfg, glyph_ranges);
+   data->font1 = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, font_size * 0.55, &font_cfg, glyph_ranges);
+   
    unsigned char* pixels;
    int width, height;
    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
@@ -2105,6 +1542,20 @@ static void shutdown_swapchain_data(struct swapchain_data *data)
    ImGui::DestroyContext(data->imgui_context);
 }
 
+static void snapshot_swapchain_frame(struct swapchain_data *data)
+{
+   struct device_data *device_data = data->device;
+   struct instance_data *instance_data = device_data->instance;
+   uint64_t now = os_time_get(); /* us */
+
+   udp_socket_check(device_data);
+   if (instance_data->socket >= 0) {
+      process_udp_socket(instance_data);
+   }
+
+   data->n_frames++;
+}
+
 static struct overlay_draw *before_present(struct swapchain_data *swapchain_data,
                                            struct queue_data *present_queue,
                                            const VkSemaphore *wait_semaphores,
@@ -2132,13 +1583,13 @@ static VkResult overlay_CreateSwapchainKHR(
     VkSwapchainKHR*                             pSwapchain)
 {
    struct device_data *device_data = FIND(struct device_data, device);
-   array<VkPresentModeKHR, 4> modes = {VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+   std::array<VkPresentModeKHR, 4> modes = {VK_PRESENT_MODE_FIFO_RELAXED_KHR,
            VK_PRESENT_MODE_IMMEDIATE_KHR,
            VK_PRESENT_MODE_MAILBOX_KHR,
            VK_PRESENT_MODE_FIFO_KHR};
 
-   if (device_data->instance->params.vsync < 4)
-      const_cast<VkSwapchainCreateInfoKHR*> (pCreateInfo)->presentMode = modes[device_data->instance->params.vsync];
+   //if (device_data->instance->params.vsync < 4)
+   //   const_cast<VkSwapchainCreateInfoKHR*> (pCreateInfo)->presentMode = modes[device_data->instance->params.vsync];
 
    VkResult result = device_data->vtable.CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
    if (result != VK_SUCCESS) return result;
@@ -2165,7 +1616,7 @@ void FpsLimiter(){
    sleepTime = targetFrameTime - (frameStart - frameEnd);
    if ( sleepTime > frameOverhead ) {
       int64_t adjustedSleep = sleepTime - frameOverhead;
-      this_thread::sleep_for(chrono::nanoseconds(adjustedSleep));
+      std::this_thread::sleep_for(std::chrono::nanoseconds(adjustedSleep));
       frameOverhead = ((os_time_get_nano() - frameStart) - adjustedSleep);
       if (frameOverhead > targetFrameTime)
          frameOverhead = 0;
@@ -2179,7 +1630,7 @@ static VkResult overlay_QueuePresentKHR(
    struct queue_data *queue_data = FIND(struct queue_data, queue);
    struct device_data *device_data = queue_data->device;
 
-   device_data->frame_stats.stats[OVERLAY_PARAM_ENABLED_frame]++;
+   //device_data->frame_stats.stats[OVERLAY_PARAM_ENABLED_frame]++;
 
    if (list_length(&queue_data->running_command_buffer) > 0) {
       /* Before getting the query results, make sure the operations have
@@ -2191,27 +1642,6 @@ static VkResult overlay_QueuePresentKHR(
       VK_CHECK(device_data->vtable.WaitForFences(device_data->device,
                                                  1, &queue_data->queries_fence,
                                                  VK_FALSE, UINT64_MAX));
-
-      /* Now get the results. */
-      list_for_each_entry_safe(struct command_buffer_data, cmd_buffer_data,
-                               &queue_data->running_command_buffer, link) {
-         list_delinit(&cmd_buffer_data->link);
-
-         if (cmd_buffer_data->timestamp_query_pool) {
-            uint64_t gpu_timestamps[2] = { 0 };
-            VK_CHECK(device_data->vtable.GetQueryPoolResults(device_data->device,
-                                                             cmd_buffer_data->timestamp_query_pool,
-                                                             cmd_buffer_data->query_index * 2, 2,
-                                                             2 * sizeof(uint64_t), gpu_timestamps, sizeof(uint64_t),
-                                                             VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT));
-
-            gpu_timestamps[0] &= queue_data->timestamp_mask;
-            gpu_timestamps[1] &= queue_data->timestamp_mask;
-            device_data->frame_stats.stats[OVERLAY_PARAM_ENABLED_gpu_timing] +=
-               (gpu_timestamps[1] - gpu_timestamps[0]) *
-               device_data->properties.limits.timestampPeriod;
-         }
-      }
    }
 
    /* Otherwise we need to add our overlay drawing semaphore to the list of
@@ -2232,25 +1662,22 @@ static VkResult overlay_QueuePresentKHR(
       present_info.pImageIndices = &image_index;
 
       struct overlay_draw *draw = before_present(swapchain_data,
-                                                   queue_data,
-                                                   pPresentInfo->pWaitSemaphores,
-                                                   pPresentInfo->waitSemaphoreCount,
-                                                   image_index);
+                                                 queue_data,
+                                                 pPresentInfo->pWaitSemaphores,
+                                                 pPresentInfo->waitSemaphoreCount,
+                                                 image_index);
 
       /* Because the submission of the overlay draw waits on the semaphores
-         * handed for present, we don't need to have this present operation
-         * wait on them as well, we can just wait on the overlay submission
-         * semaphore.
-         */
+      * handed for present, we don't need to have this present operation
+      * wait on them as well, we can just wait on the overlay submission
+      * semaphore.
+      */
       if (draw) {
          present_info.pWaitSemaphores = &draw->semaphore;
          present_info.waitSemaphoreCount = 1;
       }
 
-      uint64_t ts0 = os_time_get();
       VkResult chain_result = queue_data->device->vtable.QueuePresentKHR(queue, &present_info);
-      uint64_t ts1 = os_time_get();
-      swapchain_data->frame_stats.stats[OVERLAY_PARAM_ENABLED_present_timing] += ts1 - ts0;
       if (pPresentInfo->pResults)
          pPresentInfo->pResults[i] = chain_result;
       if (chain_result != VK_SUCCESS && result == VK_SUCCESS)
@@ -2273,8 +1700,6 @@ static VkResult overlay_BeginCommandBuffer(
    struct command_buffer_data *cmd_buffer_data =
       FIND(struct command_buffer_data, commandBuffer);
    struct device_data *device_data = cmd_buffer_data->device;
-
-   memset(&cmd_buffer_data->stats, 0, sizeof(cmd_buffer_data->stats));
 
    /* We don't record any query in secondary command buffers, just make sure
     * we have the right inheritance.
@@ -2355,8 +1780,6 @@ static VkResult overlay_ResetCommandBuffer(
       FIND(struct command_buffer_data, commandBuffer);
    struct device_data *device_data = cmd_buffer_data->device;
 
-   memset(&cmd_buffer_data->stats, 0, sizeof(cmd_buffer_data->stats));
-
    return device_data->vtable.ResetCommandBuffer(commandBuffer, flags);
 }
 
@@ -2368,15 +1791,6 @@ static void overlay_CmdExecuteCommands(
    struct command_buffer_data *cmd_buffer_data =
       FIND(struct command_buffer_data, commandBuffer);
    struct device_data *device_data = cmd_buffer_data->device;
-
-   /* Add the stats of the executed command buffers to the primary one. */
-   for (uint32_t c = 0; c < commandBufferCount; c++) {
-      struct command_buffer_data *sec_cmd_buffer_data =
-         FIND(struct command_buffer_data, pCommandBuffers[c]);
-
-      for (uint32_t s = 0; s < OVERLAY_PARAM_ENABLED_MAX; s++)
-         cmd_buffer_data->stats.stats[s] += sec_cmd_buffer_data->stats.stats[s];
-   }
 
    device_data->vtable.CmdExecuteCommands(commandBuffer, commandBufferCount, pCommandBuffers);
 }
@@ -2393,18 +1807,6 @@ static VkResult overlay_AllocateCommandBuffers(
       return result;
 
    VkQueryPool timestamp_query_pool = VK_NULL_HANDLE;
-   if (device_data->instance->params.enabled[OVERLAY_PARAM_ENABLED_gpu_timing]) {
-      VkQueryPoolCreateInfo pool_info = {
-         VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-         NULL,
-         0,
-         VK_QUERY_TYPE_TIMESTAMP,
-         pAllocateInfo->commandBufferCount * 2,
-         0,
-      };
-      VK_CHECK(device_data->vtable.CreateQueryPool(device_data->device, &pool_info,
-                                                   NULL, &timestamp_query_pool));
-   }
 
    for (uint32_t i = 0; i < pAllocateInfo->commandBufferCount; i++) {
       new_command_buffer_data(pCommandBuffers[i], pAllocateInfo->level,
@@ -2461,10 +1863,6 @@ static VkResult overlay_QueueSubmit(
       for (uint32_t c = 0; c < pSubmits[s].commandBufferCount; c++) {
          struct command_buffer_data *cmd_buffer_data =
             FIND(struct command_buffer_data, pSubmits[s].pCommandBuffers[c]);
-
-         /* Merge the submitted command buffer stats into the device. */
-         for (uint32_t st = 0; st < OVERLAY_PARAM_ENABLED_MAX; st++)
-            device_data->frame_stats.stats[st] += cmd_buffer_data->stats.stats[st];
 
          /* Attach the command buffer to the queue so we remember to read its
           * pipeline statistics & timestamps at QueuePresent().
@@ -2535,8 +1933,6 @@ static VkResult overlay_CreateDevice(
 
    device_map_queues(device_data, pCreateInfo);
 
-   init_gpu_stats(device_data);
-
    return result;
 }
 
@@ -2564,7 +1960,7 @@ static VkResult overlay_CreateInstance(
       engineName = pEngineName;
    if (engineName == "DXVK" || engineName == "vkd3d") {
       int engineVer = pCreateInfo->pApplicationInfo->engineVersion;
-      engineVersion = to_string(VK_VERSION_MAJOR(engineVer)) + "." + to_string(VK_VERSION_MINOR(engineVer)) + "." + to_string(VK_VERSION_PATCH(engineVer));
+      engineVersion = std::to_string(VK_VERSION_MAJOR(engineVer)) + "." + std::to_string(VK_VERSION_MINOR(engineVer)) + "." + std::to_string(VK_VERSION_PATCH(engineVer));
    }
 
    if (engineName != "DXVK" && engineName != "vkd3d" && engineName != "Feral3D")
@@ -2594,33 +1990,11 @@ static VkResult overlay_CreateInstance(
                              &instance_data->vtable);
    instance_data_map_physical_devices(instance_data, true);
 
-   parse_overlay_config(&instance_data->params, getenv("MANGOHUD_CONFIG"));
-   if (instance_data->params.fps_limit > 0)
-      targetFrameTime = int64_t(1000000000.0 / instance_data->params.fps_limit);
-
-   int font_size;
-   instance_data->params.font_size > 0 ? font_size = instance_data->params.font_size : font_size = 24;
-   instance_data->params.font_size > 0 ? font_size = instance_data->params.font_size : instance_data->params.font_size = 24;
+   int font_size = 12;
 
    hudSpacing = font_size / 2;
    hudFirstRow = font_size * 4.5;
    hudSecondRow = font_size * 7.5;
-
-   // Adjust height for DXVK/VKD3D version number
-   if (engineName == "DXVK" || engineName == "VKD3D"){
-      if (instance_data->params.font_size){
-         instance_data->params.height += instance_data->params.font_size / 2;
-      } else {
-         instance_data->params.height += 24 / 2;
-      }
-   }
-
-   /* If there's no control file, and an output_file was specified, start
-    * capturing fps data right away.
-    */
-   instance_data->capture_enabled =
-      instance_data->params.output_file && instance_data->params.control < 0;
-   instance_data->capture_started = instance_data->capture_enabled;
 
    return result;
 }

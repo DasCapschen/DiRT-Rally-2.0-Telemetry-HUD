@@ -33,19 +33,12 @@ endforeach
 
 vklayer_files = files(
   'overlay.cpp',
-  'overlay_params.cpp',
   'font_unispace.c',
-  'cpu.cpp',
-  'loaders/loader_nvml.cpp',
-  'nvml.cpp',
-  'file_utils.cpp',
-  'memory.cpp',
-  'config.cpp',
 )
 
 # lib_xnvctrl = cc.find_library('XNVCtrl')
 vklayer_mesa_overlay = shared_library(
-  'MangoHud',
+  'DiRTHud',
   util_files,
   vk_enum_to_str,
   vklayer_files,
@@ -74,6 +67,6 @@ vklayer_mesa_overlay = shared_library(
 )
 
 install_data(
-  files('mangohud.json'),
+  files('DiRThud.json'),
   install_dir : join_paths(get_option('datadir'), 'vulkan', 'implicit_layer.d'),
 )
