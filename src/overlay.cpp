@@ -866,13 +866,19 @@ static void compute_swapchain_display(struct swapchain_data *data)
    /* DRAW IMGUI */
    ImGui::Begin("Main", &is_open, ImGuiWindowFlags_NoDecoration);
    {
+      /*
       ImGui::Text("Socket Open: %d", instance_data->socket);
-
       ImGui::Separator();
+      */
 
-      int seconds = ((int)instance_data->telemetry_data.lap_time) % 60;
-      int millis = ((int)(instance_data->telemetry_data.lap_time * 1000.f)) % 1000;
-      int minutes = ((int)(instance_data->telemetry_data.lap_time / 60.f)) % 60;
+      float time = instance_data->telemetry_data.time;
+      if( instance_data->telemetry_data.completed_laps >= instance_data->telemetry_data.total_laps ) {
+         time = instance_data->telemetry_data.last_lap_time;
+      }
+
+      int seconds = ((int)time) % 60;
+      int millis = ((int)(time * 1000.f)) % 1000;
+      int minutes = ((int)(time / 60.f)) % 60;
       ImGui::PushFont(data->big_font);
       ImGui::Text("%02d:%02d.%03d", minutes, seconds, millis);
       ImGui::PopFont();
