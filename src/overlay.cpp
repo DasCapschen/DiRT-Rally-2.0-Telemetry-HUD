@@ -57,10 +57,10 @@
 #include <vulkan/vk_util.h>
 
 #include "telemetry.h"
+#include "overlay_params.h"
 
 bool is_open = false;
-float offset_x, offset_y, hudSpacing;
-int hudFirstRow, hudSecondRow;
+float offset_x, offset_y;
 std::string engineName, engineVersion;
 int64_t frameStart, frameEnd, targetFrameTime = 0, frameOverhead = 0, sleepTime = 0;
 
@@ -81,6 +81,7 @@ struct instance_data {
 
    int socket;
    TelemetryStruct telemetry_data;
+   overlay_params params;
 };
 
 /* Mapped from VkDevice */
@@ -327,6 +328,7 @@ static struct instance_data *new_instance_data(VkInstance instance)
 
 static void destroy_instance_data(struct instance_data *data)
 {
+   if(data->socket >= 0) close(data->socket);
    //remember to destroy our data here
    unmap_object(HKEY(data->instance));
    delete data;
@@ -484,7 +486,8 @@ static struct swapchain_data *new_swapchain_data(VkSwapchainKHR swapchain,
    struct swapchain_data *data = rzalloc(NULL, struct swapchain_data);
    data->device = device_data;
    data->swapchain = swapchain;
-   data->window_size = ImVec2(400, 300); //used to be instancedata->params.width/height
+   //data->window_size = ImVec2(300, 300); //used to be instancedata->params.width/height
+   data->window_size = ImVec2( instance_data->params.width, instance_data->params.height );
    list_inithead(&data->draws);
    map_object(HKEY(data->swapchain), data);
    return data;
@@ -636,21 +639,35 @@ static void position_layer(struct swapchain_data *data)
    struct device_data *device_data = data->device;
    struct instance_data *instance_data = device_data->instance;
    float margin = 10.0f;
-   //if (instance_data->params.offset_x > 0 || instance_data->params.offset_y > 0)
-   //   margin = 0.0f;
+   if (instance_data->params.offset_x > 0 || instance_data->params.offset_y > 0)
+      margin = 0.0f;
 
-   ImGui::SetNextWindowBgAlpha(0.69); //instance_data->params.background_alpha
+   ImGui::SetNextWindowBgAlpha(instance_data->params.background_alpha);
    ImGui::SetNextWindowSize(data->window_size, ImGuiCond_Always);
    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8,-3));
+   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4,2));
 
-   //place window bottom right
-   ImGui::SetNextWindowPos(ImVec2(data->width - data->window_size.x - margin, // + offset_x
-                                  data->height - data->window_size.y - margin), // + offset_y
-                           ImGuiCond_Always);
+   switch (instance_data->params.position) {
+   case LAYER_POSITION_TOP_LEFT:
+      ImGui::SetNextWindowPos(ImVec2(margin + instance_data->params.offset_x, margin + instance_data->params.offset_y), ImGuiCond_Always);
+      break;
+   case LAYER_POSITION_TOP_RIGHT:
+      ImGui::SetNextWindowPos(ImVec2(data->width - data->window_size.x - margin + instance_data->params.offset_x, margin + instance_data->params.offset_y),
+                              ImGuiCond_Always);
+      break;
+   case LAYER_POSITION_BOTTOM_LEFT:
+      ImGui::SetNextWindowPos(ImVec2(margin + instance_data->params.offset_x, data->height - data->window_size.y - margin + instance_data->params.offset_y),
+                              ImGuiCond_Always);
+      break;
+   case LAYER_POSITION_BOTTOM_RIGHT:
+      ImGui::SetNextWindowPos(ImVec2(data->width - data->window_size.x - margin + instance_data->params.offset_x,
+                                     data->height - data->window_size.y - margin + instance_data->params.offset_y),
+                              ImGuiCond_Always);
+      break;
+   }
 }
 
-static void RPMGauge(float fraction, const ImVec2& size_arg, float min_rpm, float max_rpm, float rpm_step, char* label_fmt, int gear, float speed, ImFont* gear_font) {
+static void RPMGauge(float fraction, const ImVec2& size_arg, float min_rpm, float max_rpm, float rpm_step, const char* label_fmt, int gear, float speed, ImFont* gear_font) {
    ImGuiWindow* window = ImGui::GetCurrentWindow();
    if (window->SkipItems)
       return;
@@ -721,12 +738,15 @@ static void RPMGauge(float fraction, const ImVec2& size_arg, float min_rpm, floa
 
    ImGui::PushFont(gear_font);
    {
-      ImVec2 label_size = ImGui::CalcTextSize(gear_buf, NULL);
-      ImGui::RenderText( ImVec2(center.x - 0.5f * label_size.x, center.y - label_size.y), gear_buf );
-      char speed_buf[9];
+      ImVec2 gear_label_size = ImGui::CalcTextSize(gear_buf, NULL);
+      ImGui::RenderText( ImVec2(center.x - 0.5f * gear_label_size.x, center.y - gear_label_size.y), gear_buf );
 
+      char speed_buf[9];
       ImFormatString(speed_buf, IM_ARRAYSIZE(speed_buf), "%3.0f km/h", speed);
-      ImGui::RenderText( ImVec2(center.x - 0.5f * label_size.x, center.y + 0.25f * label_size.y), speed_buf );
+      ImVec2 speed_label_size = ImGui::CalcTextSize(speed_buf, NULL);
+      float max_x = window->Pos.x + window->Size.x - style.ItemSpacing.x - speed_label_size.x;
+      float speed_x = ImClamp(center.x - 0.5f * gear_label_size.x, bb.Min.x,  max_x);
+      ImGui::RenderText( ImVec2(speed_x, center.y + 0.25f * speed_label_size.y), speed_buf );
    }
    ImGui::PopFont();
 
@@ -742,19 +762,6 @@ static void RPMGauge(float fraction, const ImVec2& size_arg, float min_rpm, floa
    pos = ImVec2(center.x + cos * radius - label_cos, center.y + sin * radius - 2.0f*label_sin);
    ImGui::RenderText(pos, rpm_buf);
    */
-
-   // Default displaying the fraction as percentage string, but user can override it
-   /*char overlay_buf[32];
-   if (!overlay)
-   {
-      ImFormatString(overlay_buf, IM_ARRAYSIZE(overlay_buf), "%.0f%%", fraction*100+0.01f);
-      overlay = overlay_buf;
-   }
-
-   ImVec2 overlay_size = ImGui::CalcTextSize(overlay, NULL);
-   if (overlay_size.x > 0.0f)
-      ImGui::RenderTextClipped(ImVec2(ImClamp(fill_br.x + style.ItemSpacing.x, bb.Min.x, bb.Max.x - overlay_size.x - style.ItemInnerSpacing.x), bb.Min.y), bb.Max, overlay, NULL, &overlay_size, ImVec2(0.0f,0.5f), &bb);
-      */
 }
 
 //y grows from top to bottom!!
@@ -786,11 +793,8 @@ static void VerticalProgressBar(float fraction, const ImVec2& size_arg, const ch
 
    // Default displaying the fraction as percentage string, but user can override it
    char overlay_buf[32];
-   if (!overlay)
-   {
-      ImFormatString(overlay_buf, IM_ARRAYSIZE(overlay_buf), "%.0f%%", fraction*100+0.01f);
-      overlay = overlay_buf;
-   }
+   ImFormatString(overlay_buf, IM_ARRAYSIZE(overlay_buf), overlay ? overlay : "%.0f%%", fraction*100+0.01f);
+   overlay = overlay_buf;
 
    ImVec2 overlay_size = ImGui::CalcTextSize(overlay, NULL);
    float pos_x = bb.Max.x + style.ItemSpacing.x;
@@ -859,105 +863,121 @@ static void compute_swapchain_display(struct swapchain_data *data)
    ImGui::SetCurrentContext(data->imgui_context);
    ImGui::NewFrame();
    position_layer(data);
-   ImGui::PopStyleVar(2); //push happens in position_layer()
-   //if (instance_data->params.font_size > 0 && instance_data->params.width == 280)
-   //   instance_data->params.width = hudFirstRow + hudSecondRow;
 
    /* DRAW IMGUI */
    ImGui::Begin("Main", &is_open, ImGuiWindowFlags_NoDecoration);
    {
-      /*
-      ImGui::Text("Socket Open: %d", instance_data->socket);
-      ImGui::Separator();
-      */
+      bool section0 = instance_data->params.enabled[OVERLAY_PARAM_ENABLED_show_debug];
 
-      float time = instance_data->telemetry_data.lap_time;
-      if( instance_data->telemetry_data.completed_laps >= instance_data->telemetry_data.total_laps ) {
-         time = instance_data->telemetry_data.last_lap_time;
+      bool show_time = instance_data->params.enabled[OVERLAY_PARAM_ENABLED_show_time];
+      bool show_progress = instance_data->params.enabled[OVERLAY_PARAM_ENABLED_show_progress];
+      bool section1 = show_time || show_progress;
+
+      bool section2 = instance_data->params.enabled[OVERLAY_PARAM_ENABLED_show_gauge];
+      bool section3 = instance_data->params.enabled[OVERLAY_PARAM_ENABLED_show_inputs];
+      bool section4 = instance_data->params.enabled[OVERLAY_PARAM_ENABLED_show_springs];
+
+      if( section0 )
+      {
+         ImGui::Text("Socket Connected: %d", instance_data->socket);
+         if(section1 || section2 || section3 || section4) ImGui::Separator();
       }
 
-      int seconds = ((int)time) % 60;
-      int millis = ((int)(time * 1000.f)) % 1000;
-      int minutes = ((int)(time / 60.f)) % 60;
-      ImGui::PushFont(data->big_font);
-      ImGui::Text("%02d:%02d.%03d", minutes, seconds, millis);
-      ImGui::PopFont();
-
-      float track_progress = 0;
-      if(instance_data->telemetry_data.track_length > 0) 
+      if( show_time ) 
       {
-         track_progress = instance_data->telemetry_data.lap_distance / instance_data->telemetry_data.track_length;
-      }
-      ImGui::ProgressBar(track_progress, ImVec2(0.0f, 0.0f));
-      ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
-      ImGui::Text("Progress");
+         float time = instance_data->telemetry_data.lap_time;
+         if( instance_data->telemetry_data.completed_laps >= instance_data->telemetry_data.total_laps ) {
+            time = instance_data->telemetry_data.last_lap_time;
+         }
 
-      ImGui::Separator();
-
-      int gear = (int)instance_data->telemetry_data.gear;
-      float speed = instance_data->telemetry_data.speed * 3.6f;
-      float rpm_progress = 0.0f;
-      if (instance_data->telemetry_data.max_rpm > 0)
-      {
-         rpm_progress = instance_data->telemetry_data.rpm / instance_data->telemetry_data.max_rpm;
+         int seconds = ((int)time) % 60;
+         int millis = ((int)(time * 1000.f)) % 1000;
+         int minutes = ((int)(time / 60.f)) % 60;
+         ImGui::PushFont(data->big_font);
+         ImGui::Text("%02d:%02d.%03d", minutes, seconds, millis);
+         ImGui::PopFont();
       }
 
-      /*
-      static float rpm = 0.f;
-      static float dir = 1.f;
-      rpm += dir*0.1f * ImGui::GetIO().DeltaTime;
-      if( rpm > 1 || rpm < 0 ) dir = -dir;
-      */
-      RPMGauge(rpm_progress, ImVec2(0.0f, 0.0f), 0.f, instance_data->telemetry_data.max_rpm, 100.f, "%1.0f", gear, speed, data->big_font);
-
-      ImGui::Separator();
-
-      ImGui::Columns(3);
+      if( show_progress )
       {
-         VerticalProgressBar(instance_data->telemetry_data.clutch, ImVec2(0.0f,0.0f));
-         ImGui::Text("Clutch");  
+         float track_progress = 0;
+         if(instance_data->telemetry_data.track_length > 0) 
+         {
+            track_progress = instance_data->telemetry_data.lap_distance / instance_data->telemetry_data.track_length;
+         }
+         ImGui::ProgressBar(track_progress, ImVec2(0.0f, 0.0f));
+         ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+         ImGui::Text("Progress");
+      }
 
+      if( section1 && (section2 || section3 || section4) ) ImGui::Separator();
+
+      if( section2 )
+      {
+          int gear = (int)instance_data->telemetry_data.gear;
+         float speed = instance_data->telemetry_data.speed * 3.6f;
+         float rpm_progress = 0.0f;
+         if (instance_data->telemetry_data.max_rpm > 0)
+         {
+            rpm_progress = instance_data->telemetry_data.rpm / instance_data->telemetry_data.max_rpm;
+         }
+
+         /*
+         static float rpm = 0.f;
+         static float dir = 1.f;
+         rpm += dir*0.1f * ImGui::GetIO().DeltaTime;
+         if( rpm > 1 || rpm < 0 ) dir = -dir;
+         */
+         RPMGauge(rpm_progress, ImVec2(0.0f, 0.0f), 0.f, instance_data->telemetry_data.max_rpm, 100.f, "%1.0f", gear, speed, data->big_font);
+
+         if(section3 || section4) ImGui::Separator();
+      }
+
+      if( section3 )
+      {
+         ImGui::Columns(3);
+         {
+            VerticalProgressBar(instance_data->telemetry_data.clutch, ImVec2(0.0f,60.0f));
+            ImGui::Text("Clutch");  
+
+            ImGui::NextColumn();
+
+            VerticalProgressBar(instance_data->telemetry_data.brake, ImVec2(0.0f,60.0f));
+            ImGui::Text("Brake");
+
+            ImGui::NextColumn();
+
+            VerticalProgressBar(instance_data->telemetry_data.throttle, ImVec2(0.0f,60.0f));
+            ImGui::Text("Throttle");
+         }
+         ImGui::Columns(1);
+
+         MiddleProgressBar(instance_data->telemetry_data.steering, ImVec2(-1.0f,0.0f));
+
+         if( section4 ) ImGui::Separator();
+      }
+
+      if( section4 )
+      {
+         Wheels springs = instance_data->telemetry_data.suspension_pos;
+         ImGui::Columns(2);
+         VerticalProgressBar(springs.fl, ImVec2(0.0f,60.0f));
+         VerticalProgressBar(springs.bl, ImVec2(0.0f,60.0f));
          ImGui::NextColumn();
-
-         VerticalProgressBar(instance_data->telemetry_data.brake, ImVec2(0.0f,0.0f));
-         ImGui::Text("Brake");
-
-         ImGui::NextColumn();
-
-         VerticalProgressBar(instance_data->telemetry_data.throttle, ImVec2(0.0f,0.0f));
-         ImGui::Text("Throttle");
+         VerticalProgressBar(springs.fr, ImVec2(0.0f,60.0f));
+         VerticalProgressBar(springs.br, ImVec2(0.0f,60.0f));
+         ImGui::Columns(1);
+         //last element, no separator!
       }
-      ImGui::Columns(1);
-
-      MiddleProgressBar(instance_data->telemetry_data.steering, ImVec2(-1.0f,0.0f));
-
-      //you can do text without color, and without push / pop font too!
-
-      //theres an Imgui::PlotLines() !!
 
       //auto-resize of window!
       data->window_size = ImVec2(data->window_size.x, ImGui::GetCursorPosY() + 10.0f);
    }
    ImGui::End();
 
-   /* draw crosshair!? :O
-   if (instance_data->params.enabled[OVERLAY_PARAM_ENABLED_crosshair]){
-      ImGui::SetNextWindowBgAlpha(0.0);
-      ImGui::SetNextWindowSize(ImVec2(data->width, data->height), ImGuiCond_Always);
-      ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-      ImGui::Begin("Logging", &open, ImGuiWindowFlags_NoDecoration);
-      ImVec2 horiz = ImVec2(data->width / 2 - (instance_data->params.crosshair_size / 2), data->height / 2);
-      ImVec2 vert = ImVec2(data->width / 2, data->height / 2 - (instance_data->params.crosshair_size / 2));
-      ImGui::GetWindowDrawList()->AddLine(horiz, ImVec2(horiz.x + instance_data->params.crosshair_size, horiz.y + 0),
-         IM_COL32(RGBGetRValue(instance_data->params.crosshair_color), RGBGetGValue(instance_data->params.crosshair_color),
-         RGBGetBValue(instance_data->params.crosshair_color), 255), 2.0f);
-      ImGui::GetWindowDrawList()->AddLine(vert, ImVec2(vert.x + 0, vert.y + instance_data->params.crosshair_size),
-         IM_COL32(RGBGetRValue(instance_data->params.crosshair_color), RGBGetGValue(instance_data->params.crosshair_color),
-         RGBGetBValue(instance_data->params.crosshair_color), 255), 2.0f);
-      ImGui::End();
-   }
-   */
+   //if we separate windows, begin a new one here
 
+   ImGui::PopStyleVar(2); //push happens in position_layer()
    ImGui::EndFrame();
    ImGui::Render();
 }
@@ -1530,16 +1550,15 @@ static void setup_swapchain_data_pipeline(struct swapchain_data *data)
    device_data->vtable.DestroyShaderModule(device_data->device, frag_module, NULL);
 
    ImGuiIO& io = ImGui::GetIO();
-   int font_size = 16;
 
    // ImGui takes ownership of the data, no need to free it
    ImFontConfig font_cfg = ImFontConfig();
    const char* ttf_compressed_base85 = GetDefaultCompressedFontDataTTFBase85();
    const ImWchar* glyph_ranges = io.Fonts->GetGlyphRangesDefault();
 
-   data->small_font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, 16, &font_cfg, glyph_ranges);
-   data->medium_font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, 48, &font_cfg, glyph_ranges);
-   data->big_font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, 64, &font_cfg, glyph_ranges);
+   data->small_font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, device_data->instance->params.font_size_small, &font_cfg, glyph_ranges);
+   data->medium_font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, device_data->instance->params.font_size_medium, &font_cfg, glyph_ranges);
+   data->big_font = io.Fonts->AddFontFromMemoryCompressedBase85TTF(ttf_compressed_base85, device_data->instance->params.font_size_big, &font_cfg, glyph_ranges);
    
    unsigned char* pixels;
    int width, height;
@@ -1763,7 +1782,6 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
 {
    struct device_data *device_data = data->device;
    struct instance_data *instance_data = device_data->instance;
-   uint64_t now = os_time_get(); /* us */
 
    udp_socket_check(device_data);
    if (instance_data->socket >= 0) {
@@ -1805,8 +1823,8 @@ static VkResult overlay_CreateSwapchainKHR(
            VK_PRESENT_MODE_MAILBOX_KHR,
            VK_PRESENT_MODE_FIFO_KHR};
 
-   //if (device_data->instance->params.vsync < 4)
-   //   const_cast<VkSwapchainCreateInfoKHR*> (pCreateInfo)->presentMode = modes[device_data->instance->params.vsync];
+   if (device_data->instance->params.vsync < 4)
+      const_cast<VkSwapchainCreateInfoKHR*> (pCreateInfo)->presentMode = modes[device_data->instance->params.vsync];
 
    VkResult result = device_data->vtable.CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
    if (result != VK_SUCCESS) return result;
@@ -1829,7 +1847,7 @@ static void overlay_DestroySwapchainKHR(
    destroy_swapchain_data(swapchain_data);
 }
 
-void FpsLimiter(){
+void FpsLimiter() {
    sleepTime = targetFrameTime - (frameStart - frameEnd);
    if ( sleepTime > frameOverhead ) {
       int64_t adjustedSleep = sleepTime - frameOverhead;
@@ -2207,12 +2225,13 @@ static VkResult overlay_CreateInstance(
                              &instance_data->vtable);
    instance_data_map_physical_devices(instance_data, true);
 
-   int font_size = 16;
+   parse_overlay_config(&instance_data->params, getenv("DIRTHUD_CONFIG"));
+   if (instance_data->params.fps_limit > 0)
+      targetFrameTime = int64_t(1000000000.0 / instance_data->params.fps_limit);
 
-   hudSpacing = font_size / 2;
-   hudFirstRow = font_size * 4.5;
-   hudSecondRow = font_size * 7.5;
-
+   instance_data->params.font_size_small = instance_data->params.font_size_small > 0 ? instance_data->params.font_size_small : 16;
+   instance_data->params.font_size_medium = instance_data->params.font_size_medium > 0 ? instance_data->params.font_size_medium : 48;
+   instance_data->params.font_size_big = instance_data->params.font_size_big > 0 ? instance_data->params.font_size_big : 64;
    return result;
 }
 
