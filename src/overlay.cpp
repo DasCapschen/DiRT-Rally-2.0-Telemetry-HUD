@@ -683,7 +683,12 @@ static void RPMGauge(float fraction, const ImVec2& size_arg, float min_rpm, floa
    window->DrawList->PathStroke(ImGui::GetColorU32(ImGuiCol_FrameBg), false, thickness);
 
    window->DrawList->PathArcTo(center, radius - thickness, angle_min, fraction_angle, 30);
-   window->DrawList->PathStroke(ImGui::GetColorU32(ImGuiCol_PlotHistogram), false, thickness - style.FrameBorderSize);
+   
+   ImVec4 rpm_color = ImGui::GetStyleColorVec4(ImGuiCol_PlotHistogram);
+   ImVec4 rpm_warn_color(230, 0, 0, 1);
+   float color_fraction = ImClamp( (fraction-0.75f)*5.5f, 0.0f, 1.0f );
+   rpm_color = ImLerp( rpm_color, rpm_warn_color, color_fraction );
+   window->DrawList->PathStroke(ImGui::ColorConvertFloat4ToU32(rpm_color), false, thickness - style.FrameBorderSize);
 
    int steps = (max_rpm - min_rpm) / rpm_step;
    for (int i = 0; i <= steps; i++)
@@ -890,6 +895,13 @@ static void compute_swapchain_display(struct swapchain_data *data)
       {
          rpm_progress = instance_data->telemetry_data.rpm / instance_data->telemetry_data.max_rpm;
       }
+
+      /*
+      static float rpm = 0.f;
+      static float dir = 1.f;
+      rpm += dir*0.1f * ImGui::GetIO().DeltaTime;
+      if( rpm > 1 || rpm < 0 ) dir = -dir;
+      */
       RPMGauge(rpm_progress, ImVec2(0.0f, 0.0f), 0.f, instance_data->telemetry_data.max_rpm, 100.f, "%1.0f", gear, speed, data->big_font);
 
       ImGui::Separator();
