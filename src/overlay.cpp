@@ -871,7 +871,7 @@ static void compute_swapchain_display(struct swapchain_data *data)
       ImGui::Separator();
       */
 
-      float time = instance_data->telemetry_data.time;
+      float time = instance_data->telemetry_data.lap_time;
       if( instance_data->telemetry_data.completed_laps >= instance_data->telemetry_data.total_laps ) {
          time = instance_data->telemetry_data.last_lap_time;
       }
