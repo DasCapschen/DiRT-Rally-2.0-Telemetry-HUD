@@ -7,10 +7,10 @@ struct Vec3 {
 };
 
 struct Wheels {
-    float fl;
-    float fr;
     float bl;
     float br;
+    float fl;
+    float fr;
 };
 
 struct TelemetryStruct {

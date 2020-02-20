@@ -960,12 +960,20 @@ static void compute_swapchain_display(struct swapchain_data *data)
       if( section4 )
       {
          Wheels springs = instance_data->telemetry_data.suspension_pos;
+
+         //we don't get any max and min values, but the value is absolute... so... adjust as we go...
+         static float max_springs = 1;
+         static float min_springs = -1;
+         max_springs = ImMax(max_springs, ImMax( springs.bl, ImMax(springs.br, ImMax(springs.fl, springs.fr))));
+         min_springs = ImMin(min_springs, ImMin( springs.bl, ImMin(springs.br, ImMin(springs.fl, springs.fr))));
+         float spring_range = max_springs - min_springs;
+
          ImGui::Columns(2);
-         VerticalProgressBar(springs.fl, ImVec2(0.0f,60.0f));
-         VerticalProgressBar(springs.bl, ImVec2(0.0f,60.0f));
+         VerticalProgressBar((springs.fl-min_springs)/spring_range, ImVec2(0.0f,60.0f));
+         VerticalProgressBar((springs.br-min_springs)/spring_range, ImVec2(0.0f,60.0f));
          ImGui::NextColumn();
-         VerticalProgressBar(springs.fr, ImVec2(0.0f,60.0f));
-         VerticalProgressBar(springs.br, ImVec2(0.0f,60.0f));
+         VerticalProgressBar((springs.fr-min_springs)/spring_range, ImVec2(0.0f,60.0f));
+         VerticalProgressBar((springs.br-min_springs)/spring_range, ImVec2(0.0f,60.0f));
          ImGui::Columns(1);
          //last element, no separator!
       }
