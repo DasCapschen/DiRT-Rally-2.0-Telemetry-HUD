@@ -484,7 +484,7 @@ static struct swapchain_data *new_swapchain_data(VkSwapchainKHR swapchain,
    struct swapchain_data *data = rzalloc(NULL, struct swapchain_data);
    data->device = device_data;
    data->swapchain = swapchain;
-   data->window_size = ImVec2(500, 300); //used to be instancedata->params.width/height
+   data->window_size = ImVec2(400, 300); //used to be instancedata->params.width/height
    list_inithead(&data->draws);
    map_object(HKEY(data->swapchain), data);
    return data;
@@ -890,7 +890,7 @@ static void compute_swapchain_display(struct swapchain_data *data)
       }
       ImGui::ProgressBar(track_progress, ImVec2(0.0f, 0.0f));
       ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
-      ImGui::Text("Track Progress");
+      ImGui::Text("Progress");
 
       ImGui::Separator();
 
